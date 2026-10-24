@@ -31,6 +31,7 @@ Muhim xavfsizlik eslatmalari:
 
 import hashlib
 import io
+import json
 import logging
 import os
 import re
@@ -38,8 +39,12 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import threading
+import urllib.parse
+import urllib.request
 import zipfile
 from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 # ---------------------------------------------------------------- sozlamalar
@@ -452,6 +457,480 @@ def check_python_syntax(file_path: Path) -> tuple[bool, str]:
 
 # ---------------------------------------------------------------- telegram qismi
 
+# ---------------------------------------------------------------- sayt API (Uzbek bot sayti uchun)
+# Maqsad: server botda ishlayotgan kod botining (masalan, Uzbek bot, Bot #1)
+# katalogini GitHub Pages saytiga berish. FadeHost da ilova veb manzili
+# allaqachon yoqilgan (lekin-server-bot.fadehost.app, PORT=8080), shuning
+# uchun shu jarayonda alohida oqimda kichik HTTP server ishlaydi.
+# Xavfsizlik: tokenlar logga yozilmaydi, faqat BOT_TOKEN orqali Telegram
+# getFile/file proxy qilinadi; admin/auth endpointlar bu v1 da yo'q.
+# Katta videolar (>20 MB) Bot API orqali yuklab bo'lmaydi — bu holda
+# proxy 404 qaytaradi (MTProto fazasi alohida, API_ID/HASH kerak bo'ladi).
+
+SITE_API_ORIGIN = "https://musayeva951.github.io"
+SITE_CHAT_SECRET = os.environ.get("SITE_CHAT_SECRET", "")
+_SITE_POSTER_CACHE: dict = {}
+
+
+def _site_api_bot_row():
+    """Sayt uchun bot qatori: SITE_BOT_ID bo'lsa shu, bo'lmasa birinchi kod boti."""
+    wanted = os.environ.get("SITE_BOT_ID", "").strip()
+    if wanted:
+        try:
+            row = get_bot(int(wanted))
+            if row is not None and row["kind"] == "code":
+                return row
+        except Exception:
+            pass
+    # get_all_bots dan birinchi kod botini olamiz (server botda odatda bitta bot bo'ladi)
+    for row in get_all_bots():
+        if row["kind"] == "code":
+            return row
+    return None
+
+
+def _site_api_db_path(row):
+    if row is None or not row["code_dir"]:
+        return None
+    code_dir = Path(row["code_dir"])
+    preferred = code_dir / "uz.dubanime_v1.db"
+    if preferred.exists():
+        return preferred
+    # Kod papkasidagi birinchi .db (animelar jadvali borligini keyin tekshiramiz)
+    for p in sorted(code_dir.glob("*.db")):
+        return p
+    return None
+
+
+def _site_api_token(row):
+    if row is None or not row["token_enc"]:
+        return ""
+    try:
+        return decrypt_token(row["token_enc"])
+    except Exception:
+        return ""
+
+
+def _site_api_db():
+    row = _site_api_bot_row()
+    path = _site_api_db_path(row)
+    if path is None:
+        return None, row, None
+    con = sqlite3.connect(str(path), timeout=10)
+    con.row_factory = sqlite3.Row
+    try:
+        con.execute("PRAGMA busy_timeout=10000")
+    except Exception:
+        pass
+    return con, row, path
+
+
+def _site_anime_list():
+    con, _, _ = _site_api_db()
+    if con is None:
+        return []
+    try:
+        rows = con.execute(
+            "SELECT kod, title, caption, is_premium, holat FROM animelar ORDER BY kod DESC"
+        ).fetchall()
+        out = []
+        for r in rows:
+            try:
+                cnt = con.execute(
+                    "SELECT COUNT(*) c FROM serial_qismlar WHERE anime_kod=?", (r["kod"],)
+                ).fetchone()["c"]
+            except Exception:
+                cnt = 0
+            out.append({
+                "kod": r["kod"],
+                "title": r["title"] or "",
+                "caption": r["caption"] or "",
+                "holat": r["holat"] or "tugatigan",
+                "is_premium": int(r["is_premium"] or 0),
+                "qism_soni": cnt,
+                "poster": "/api/poster/%d" % r["kod"],
+            })
+        return out
+    finally:
+        con.close()
+
+
+def _site_anime_detail(kod):
+    con, _, _ = _site_api_db()
+    if con is None:
+        return None
+    try:
+        r = con.execute(
+            "SELECT kod, title, caption, is_premium, holat FROM animelar WHERE kod=?",
+            (kod,),
+        ).fetchone()
+        if not r:
+            return None
+        eps = con.execute(
+            "SELECT qism_raqam FROM serial_qismlar WHERE anime_kod=? ORDER BY qism_raqam",
+            (kod,),
+        ).fetchall()
+        return {
+            "kod": r["kod"],
+            "title": r["title"] or "",
+            "caption": r["caption"] or "",
+            "holat": r["holat"] or "tugatigan",
+            "is_premium": int(r["is_premium"] or 0),
+            "qism_soni": len(eps),
+            "poster": "/api/poster/%d" % r["kod"],
+            "qismlar": [e["qism_raqam"] for e in eps],
+        }
+    finally:
+        con.close()
+
+
+def _site_episode_file(kod, qism):
+    con, _, _ = _site_api_db()
+    if con is None:
+        return None, 0
+    try:
+        row = con.execute(
+            "SELECT file_id, file_size FROM serial_qismlar WHERE anime_kod=? AND qism_raqam=?",
+            (kod, qism),
+        ).fetchone()
+        if not row:
+            return None, 0
+        return row["file_id"], row["file_size"] or 0
+    finally:
+        con.close()
+
+
+def _site_shorts_list():
+    con, _, _ = _site_api_db()
+    if con is None:
+        return []
+    try:
+        rows = con.execute(
+            "SELECT s.id, s.anime_kod, s.sarlavha, s.yaratilgan, a.title "
+            "FROM anime_shorts s LEFT JOIN animelar a ON a.kod = s.anime_kod "
+            "ORDER BY s.id DESC"
+        ).fetchall()
+        out = []
+        for r in rows:
+            out.append({
+                "id": r["id"],
+                "anime_kod": r["anime_kod"],
+                "anime_title": r["title"] or "",
+                "sarlavha": r["sarlavha"] or "",
+                "yaratilgan": r["yaratilgan"] or "",
+                "video": "/api/shorts/video/%d" % r["id"],
+                "poster": "/api/poster/%d" % r["anime_kod"],
+            })
+        return out
+    except Exception:
+        return []
+    finally:
+        con.close()
+
+
+def _site_short_file(short_id):
+    con, _, _ = _site_api_db()
+    if con is None:
+        return None, 0
+    try:
+        row = con.execute(
+            "SELECT file_id, file_size FROM anime_shorts WHERE id = ?", (short_id,)
+        ).fetchone()
+        if not row:
+            return None, 0
+        return row["file_id"], row["file_size"] or 0
+    finally:
+        con.close()
+
+
+def _site_telegram_file_bytes(token, file_id, cache_key=None):
+    if cache_key and cache_key in _SITE_POSTER_CACHE:
+        return _SITE_POSTER_CACHE[cache_key]
+    try:
+        with urllib.request.urlopen(
+            "https://api.telegram.org/bot%s/getFile?file_id=%s" % (token, urllib.parse.quote(file_id, safe="")),
+            timeout=15,
+        ) as resp:
+            info = json.loads(resp.read().decode())
+        fp = info.get("result", {}).get("file_path")
+        if not fp:
+            return None
+        with urllib.request.urlopen(
+            "https://api.telegram.org/file/bot%s/%s" % (token, fp), timeout=30
+        ) as resp:
+            data = resp.read()
+        if cache_key and len(data) < 15000000:
+            _SITE_POSTER_CACHE[cache_key] = data
+        return data
+    except Exception:
+        return None
+
+
+def _site_poster_bytes(kod):
+    if kod in _SITE_POSTER_CACHE:
+        return _SITE_POSTER_CACHE[kod]
+    row = _site_api_bot_row()
+    token = _site_api_token(row)
+    if not token:
+        return None
+    con, _, _ = _site_api_db()
+    if con is None:
+        return None
+    try:
+        r = con.execute("SELECT file_id FROM animelar WHERE kod=?", (kod,)).fetchone()
+    finally:
+        con.close()
+    if not r or not r["file_id"]:
+        return None
+    data = _site_telegram_file_bytes(token, r["file_id"])
+    if data and len(data) < 5000000:
+        _SITE_POSTER_CACHE[kod] = data
+    return data
+
+
+def _site_config_value(key):
+    con, _, _ = _site_api_db()
+    if con is None:
+        return None, ""
+    try:
+        r = con.execute("SELECT file_id, extra FROM site_config WHERE key=?", (key,)).fetchone()
+        return (r["file_id"], r["extra"]) if r else (None, "")
+    except Exception:
+        return None, ""
+    finally:
+        con.close()
+
+
+class _SiteApiHandler(BaseHTTPRequestHandler):
+    def _send(self, code, body, ctype="application/json"):
+        data = body if isinstance(body, bytes) else body.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Access-Control-Allow-Origin", SITE_API_ORIGIN)
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _proxy_telegram_file(self, token, file_id, file_size=0):
+        # Bot API orqali uzatish, Range ni Telegram'ga uzatamiz (seek ishlashi uchun)
+        try:
+            with urllib.request.urlopen(
+                "https://api.telegram.org/bot%s/getFile?file_id=%s" % (token, urllib.parse.quote(file_id, safe="")),
+                timeout=15,
+            ) as resp:
+                info = json.loads(resp.read().decode())
+            if not info.get("ok"):
+                return self._send(404, json.dumps({"ok": False}))
+            fp = info.get("result", {}).get("file_path")
+            if not fp:
+                return self._send(404, json.dumps({"ok": False}))
+        except Exception:
+            return self._send(404, json.dumps({"ok": False}))
+        file_url = "https://api.telegram.org/file/bot%s/%s" % (token, fp)
+        req = urllib.request.Request(file_url)
+        range_hdr = self.headers.get("Range")
+        if range_hdr:
+            req.add_header("Range", range_hdr)
+        try:
+            resp = urllib.request.urlopen(req, timeout=60)
+        except Exception:
+            return self._send(502, json.dumps({"ok": False}))
+        code = resp.getcode()
+        self.send_response(code)
+        self.send_header("Content-Type", resp.headers.get("Content-Type", "video/mp4"))
+        if resp.headers.get("Content-Length"):
+            self.send_header("Content-Length", resp.headers.get("Content-Length"))
+        if resp.headers.get("Content-Range"):
+            self.send_header("Content-Range", resp.headers.get("Content-Range"))
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Access-Control-Allow-Origin", SITE_API_ORIGIN)
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        try:
+            while True:
+                chunk = resp.read(65536)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        finally:
+            resp.close()
+
+    def do_GET(self):
+        path = self.path.split("?")[0]
+        row = _site_api_bot_row()
+        token = _site_api_token(row)
+        if path in ("/", "/health"):
+            return self._send(200, json.dumps({"ok": True, "service": "server-bot-site-api"}))
+        if path == "/api/animes":
+            try:
+                return self._send(200, json.dumps({"ok": True, "animes": _site_anime_list()}, ensure_ascii=False))
+            except Exception:
+                return self._send(500, json.dumps({"ok": False, "error": "db"}))
+        if path.startswith("/api/anime/"):
+            try:
+                kod = int(path.rsplit("/", 1)[-1])
+            except ValueError:
+                return self._send(404, json.dumps({"ok": False}))
+            detail = _site_anime_detail(kod)
+            if not detail:
+                return self._send(404, json.dumps({"ok": False}))
+            return self._send(200, json.dumps({"ok": True, "anime": detail}, ensure_ascii=False))
+        if path.startswith("/api/video/"):
+            parts = path.split("/")
+            try:
+                kod = int(parts[3]); qism = int(parts[4])
+            except (IndexError, ValueError):
+                return self._send(404, json.dumps({"ok": False}))
+            if not token:
+                return self._send(404, json.dumps({"ok": False}))
+            file_id, file_size = _site_episode_file(kod, qism)
+            if not file_id:
+                return self._send(404, json.dumps({"ok": False}))
+            return self._proxy_telegram_file(token, file_id, file_size)
+        if path == "/api/shorts":
+            try:
+                return self._send(200, json.dumps({"ok": True, "shorts": _site_shorts_list()}, ensure_ascii=False))
+            except Exception:
+                return self._send(500, json.dumps({"ok": False}))
+        if path.startswith("/api/shorts/video/"):
+            try:
+                sid = int(path.rsplit("/", 1)[-1])
+            except ValueError:
+                return self._send(404, json.dumps({"ok": False}))
+            if not token:
+                return self._send(404, json.dumps({"ok": False}))
+            file_id, file_size = _site_short_file(sid)
+            if not file_id:
+                return self._send(404, json.dumps({"ok": False}))
+            return self._proxy_telegram_file(token, file_id, file_size)
+        if path.startswith("/api/poster/"):
+            try:
+                kod = int(path.rsplit("/", 1)[-1])
+            except ValueError:
+                return self._send(404, json.dumps({"ok": False}))
+            data = _site_poster_bytes(kod)
+            if not data:
+                return self._send(404, json.dumps({"ok": False}))
+            ctype = "image/jpeg"
+            if data[:8].startswith(b"\x89PNG"):
+                ctype = "image/png"
+            elif data[:6] in (b"GIF87a", b"GIF89a"):
+                ctype = "image/gif"
+            elif data[:4] == b"RIFF":
+                ctype = "image/webp"
+            return self._send(200, data, ctype)
+        if path == "/api/site-config":
+            bg_id, bg_type = _site_config_value("bg_image")
+            mus_id, mus_name = _site_config_value("music")
+            return self._send(200, json.dumps({
+                "ok": True,
+                "bg": "/api/site-bg" if bg_id else None,
+                "bg_type": bg_type or "image",
+                "music": "/api/site-music" if mus_id else None,
+                "music_name": mus_name or "",
+            }, ensure_ascii=False))
+        if path == "/api/site-bg":
+            bg_id, bg_type = _site_config_value("bg_image")
+            if not bg_id or not token:
+                return self._send(404, json.dumps({"ok": False}))
+            if bg_type == "video":
+                return self._proxy_telegram_file(token, bg_id)
+            data = _site_telegram_file_bytes(token, bg_id, "site_bg")
+            if not data:
+                return self._send(404, json.dumps({"ok": False}))
+            return self._send(200, data, "image/jpeg")
+        if path == "/api/site-music":
+            mus_id, _ = _site_config_value("music")
+            if not mus_id or not token:
+                return self._send(404, json.dumps({"ok": False}))
+            return self._proxy_telegram_file(token, mus_id)
+        if path == "/api/chat":
+            con, _, _ = _site_api_db()
+            if con is None:
+                return self._send(200, json.dumps({"ok": True, "messages": []}, ensure_ascii=False))
+            try:
+                rows = con.execute(
+                    "SELECT username, text, created_at FROM chat_messages ORDER BY id DESC LIMIT 50"
+                ).fetchall()
+                msgs = [{"user": r["username"] or "Anonim", "text": r["text"],
+                         "time": r["created_at"][11:16] if r["created_at"] else ""}
+                        for r in reversed(rows)]
+                return self._send(200, json.dumps({"ok": True, "messages": msgs}, ensure_ascii=False))
+            except Exception:
+                return self._send(200, json.dumps({"ok": True, "messages": []}, ensure_ascii=False))
+            finally:
+                con.close()
+        return self._send(404, json.dumps({"ok": False}))
+
+    def do_POST(self):
+        path = self.path.split("?")[0]
+        if path != "/api/chat/send":
+            return self._send(404, json.dumps({"ok": False}))
+        try:
+            length = int(self.headers.get("Content-Length", 0) or 0)
+            body = json.loads(self.rfile.read(length).decode() or "{}")
+            text = re.sub(r"<[^>]*>", "", (body.get("text") or "").strip()[:500])
+            username = re.sub(r"<[^>]*>", "", (body.get("username") or "Anonim").strip()[:30]) or "Anonim"
+            if not text:
+                return self._send(400, json.dumps({"ok": False}))
+            name = username.strip().lower().lstrip("@")
+            secret = body.get("secret") or ""
+            if ("kitagawa" in name or "umid_ss7" in name or name in ("admin", "animed", "animed.uz")):
+                if not SITE_CHAT_SECRET or secret != SITE_CHAT_SECRET:
+                    return self._send(403, json.dumps({"ok": False, "err": "reserved_name"}))
+            ip = (self.headers.get("X-Forwarded-For", "") or "").split(",")[0].strip() or self.client_address[0]
+            con, _, _ = _site_api_db()
+            if con is None:
+                return self._send(500, json.dumps({"ok": False}))
+            try:
+                con.execute("CREATE TABLE IF NOT EXISTS chat_rate (ip TEXT, username TEXT, ts REAL)")
+                import time as _time
+                now = _time.time()
+                con.execute("DELETE FROM chat_rate WHERE ts < ?", (now - 3600,))
+                global_n = con.execute("SELECT COUNT(*) FROM chat_rate WHERE ts > ?", (now - 10,)).fetchone()[0]
+                if global_n >= 20:
+                    return self._send(429, json.dumps({"ok": False, "err": "too_many"}))
+                ip_rows = con.execute("SELECT ts FROM chat_rate WHERE ip = ? ORDER BY ts DESC LIMIT 1", (ip,)).fetchall()
+                if ip_rows and now - ip_rows[0][0] < 5:
+                    return self._send(429, json.dumps({"ok": False, "err": "too_fast"}))
+                con.execute("INSERT INTO chat_rate (ip, username, ts) VALUES (?, ?, ?)", (ip, name, now))
+                con.execute("INSERT INTO chat_messages (user_id, username, text, created_at) VALUES (0, ?, ?, ?)",
+                            (username, text, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+                con.execute("DELETE FROM chat_messages WHERE id NOT IN (SELECT id FROM chat_messages ORDER BY id DESC LIMIT 200)")
+                con.commit()
+            finally:
+                con.close()
+            return self._send(200, json.dumps({"ok": True}))
+        except Exception:
+            return self._send(500, json.dumps({"ok": False}))
+
+    def do_OPTIONS(self):
+        self.send_response(200)
+        self.send_header("Access-Control-Allow-Origin", SITE_API_ORIGIN)
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.end_headers()
+
+    def log_message(self, *a):
+        pass
+
+
+def start_site_api_server():
+    port = int(os.environ.get("PORT", "8080") or 8080)
+    try:
+        srv = ThreadingHTTPServer(("0.0.0.0", port), _SiteApiHandler)
+    except OSError as e:
+        log.warning("Site API server %d-portda ochilmadi: %s", port, e)
+        return
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    log.info("Site API server ishga tushdi: 0.0.0.0:%d", port)
+
+
 def build_app():
     """python-telegram-bot ilovasini yig'adi (import shu yerda — sinov importi yengil bo'lsin)."""
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
@@ -801,6 +1280,7 @@ def main():
     if not SERVER_BOT_SECRET:
         print("OGOHLANTIRISH: SERVER_BOT_SECRET yo'q — tokenlar kuchli shifrlanmaydi!")
     init_db()
+    start_site_api_server()
     app = build_app()
     app.run_polling(drop_pending_updates=True)
 
