@@ -7,11 +7,12 @@ Odamlar anime bot ochish uchun alohida server qidirib yurmaydi:
       server bot tokenni getMe bilan tekshiradi, shifrlab saqlaydi va
       tayyor anime bot shablonidan (child_anime_bot.py) nusxa ishga
       tushiradi, har bir bot uchun ALOHIDA SQLite baza bilan.
-  2-usul (kod): token bergisi kelmagan foydalanuvchi o'z botining
-      kodini (.py bitta fayl yoki .zip ichida bot.py/main.py) tashlaydi ->
-      server bot uni alohida papkada saqlab, alohida jarayon sifatida
-      ishga tushiradi. Kod ichida tokenning o'zi bo'lishi foydalanuvchi
-      zimmasida (bot matnlarida ham shu aytiladi).
+  2-usul (kod): foydalanuvchi o'z botining kodini (.py bitta fayl yoki
+      .zip ichida bot.py/main.py) tashlaydi, keyin shu kod uchun bot
+      tokenini alohida yuboradi -> server bot tokenni getMe bilan
+      tekshiradi, shifrlab saqlaydi va ishga tushirishda BOT_TOKEN env
+      orqali kodga beradi. Kod ichida token bo'lishi shart emas; token
+      kodga env orqali beriladi, kod egasi o'zi javobgar.
 
 Ishga tushirish:
     SERVER_BOT_TOKEN=... SERVER_BOT_SECRET=... python server_bot.py
@@ -308,11 +309,25 @@ def start_bot(bot_id: int) -> tuple[bool, str]:
         if not entry or not entry.exists():
             return False, "Kod fayli topilmadi"
         script = entry
+        # Kod boti tokeni: bazada shifrlangan holda saqlanadi, ishga
+        # tushirishda BOT_TOKEN env orqali beriladi (masalan, Uzbek bot
+        # kodi BOT_TOKEN ni env dan o'qiydi). Token bo'lmasa — boshlanmaydi,
+        # foydalanuvchi avval «🔑 Token kiritish» orqali token berishi kerak.
+        # Eslatma: asosiy bot tokeni va SERVER_BOT_SECRET bolaga berilmaydi.
+        try:
+            code_token = decrypt_token(row["token_enc"]) if row["token_enc"] else ""
+        except Exception as e:
+            return False, f"Tokenni ochib bo'lmadi: {e}"
+        if not code_token:
+            return False, "Bu kod botiga token kiritilmagan — «🔑 Token kiritish» ni bosing."
         env = _clean_env({
             "OWNER_ID": str(row["owner_id"]),
             "CHILD_DB_PATH": str(work / "child.db"),
-            # Eslatma: kod usulida token kodning ichida bo'ladi, env orqali
-            # asosiy bot tokeni ham, boshqa botlar tokenlari ham berilmaydi.
+            "BOT_TOKEN": code_token,
+            "CHILD_BOT_TOKEN": code_token,
+            # Kod boti egasi — shu botning admini (Uzbek bot kodi
+            # SUPER_ADMIN_ID ni env dan o'qiydi, OWNER_ID ni emas).
+            "SUPER_ADMIN_ID": str(row["owner_id"]),
         })
         cwd = Path(row["code_dir"])
     log_file = open(bot_log_path(bot_id), "ab")  # noqa: SIM115 - jarayon yashaguncha ochiq turadi
@@ -463,8 +478,9 @@ def build_app():
         "*1-usul — token:* «➕ Bot qo'shish (token)» ni bosing va BotFather bergan tokenni yuboring. "
         "Shu token bilan tayyor anime bot nusxasi ishga tushadi: o'z katalogingiz, alohida baza.\n\n"
         "*2-usul — kod:* «📁 Bot qo'shish (kod)» ni bosib, botingiz kodini (.py fayl yoki ichida "
-        "bot.py/main.py bor .zip) tashlang. Kod o'z papkasida alohida jarayon bo'lib ishlaydi. "
-        "⚠️ Kod usulida token kodning ICHIDA bo'lishi sizning zimmangizda — biz tokenni koddan ajratib olmaymiz.\n\n"
+        "bot.py/main.py bor .zip) tashlang, keyin shu kod uchun bot tokenini yuboring. Token getMe bilan "
+        "tekshirilib, shifrlab saqlanadi va ishga tushirishda BOT_TOKEN env orqali kodga beriladi. "
+        "Kod o'z papkasida alohida jarayon bo'lib ishlaydi.\n\n"
         f"Cheklovlar: hozircha har foydalanuvchiga {MAX_BOTS_PER_USER} ta bot, jami {MAX_BOTS} ta bot "
         "(tekin server kuchsiz: 256 MB xotira, kuniga 1 GB trafik — shuning uchun limit bor). "
         "Fayl limiti: 2 MB.\n\n"
@@ -485,13 +501,17 @@ def build_app():
 
     # ---------- mening botlarim ----------
 
-    def bot_buttons(bot_id: int):
-        return InlineKeyboardMarkup([
+    def bot_buttons(bot_id: int, kind: str = "", has_token: bool = True):
+        rows = [
             [InlineKeyboardButton("▶️ Ishga tushirish", callback_data=f"act:start:{bot_id}"),
              InlineKeyboardButton("⏹ To'xtatish", callback_data=f"act:stop:{bot_id}")],
             [InlineKeyboardButton("📄 Log", callback_data=f"act:log:{bot_id}"),
              InlineKeyboardButton("🗑 O'chirish", callback_data=f"act:delask:{bot_id}")],
-        ])
+        ]
+        # Kod botiga token hali kiritilmagan bo'lsa — alohida tugma ko'rsatamiz.
+        if kind == "code" and not has_token:
+            rows.append([InlineKeyboardButton("🔑 Token kiritish", callback_data=f"act:codetoken:{bot_id}")])
+        return InlineKeyboardMarkup(rows)
 
     async def my_bots(update, context):
         user_id = update.effective_user.id
@@ -507,7 +527,7 @@ def build_app():
             name = f"@{row['bot_username']}" if row["bot_username"] else "(kod usuli)"
             await update.message.reply_text(
                 f"🤖 Bot #{row['id']} — {name}\nUsul: {kind}\nHolat: {status}\nYaratilgan: {row['created_at']}",
-                reply_markup=bot_buttons(row["id"]),
+                reply_markup=bot_buttons(row["id"], kind=row["kind"], has_token=bool(row["token_enc"])),
             )
 
     async def bot_action(update, context):
@@ -518,6 +538,18 @@ def build_app():
         row = get_bot(bot_id)
         if row is None or row["owner_id"] != q.from_user.id:
             await q.edit_message_text("Bot topilmadi yoki sizniki emas.")
+            return
+        if action == "codetoken":
+            if row["kind"] != "code":
+                await q.edit_message_text(f"Bot #{bot_id}: token faqat kod usulidagi botlar uchun kiritiladi.")
+                return
+            context.user_data["await"] = "code_token"
+            context.user_data["code_bot_id"] = bot_id
+            await q.message.reply_text(
+                f"Bot #{bot_id} uchun tokenni yuboring.\n"
+                "Token getMe bilan tekshirilib, shifrlab saqlanadi va ishga tushirishda "
+                "BOT_TOKEN env orqali kodga beriladi. Token chatdan o'chirishga harakat qilinadi."
+            )
             return
         if action == "start":
             ok, msg = start_bot(bot_id)
@@ -614,7 +646,8 @@ def build_app():
         context.user_data["await"] = "code"
         await update.message.reply_text(
             "Bot kodingizni tashlang: bitta .py fayl yoki ichida bot.py/main.py bor .zip (2 MB gacha).\n"
-            "⚠️ Token kodning ICHIDA bo'lishi kerak — uni ajratib olmaymiz.\n"
+            "Kod qabul qilingach, shu kod uchun bot tokenini so'rayman — token shifrlab saqlanadi va "
+            "ishlashda BOT_TOKEN env orqali kodga beriladi.\n"
             "⚠️ Kod alohida jarayon bo'lib ochiq ishga tushadi: to'liq izolyatsiya yo'q, kodingiz uchun o'zingiz javobgarsiz."
         )
 
@@ -666,9 +699,60 @@ def build_app():
             await update.message.reply_text(f"Kodda sintaksis xato bor, qabul qilinmadi:\n{msg}")
             return
         update_bot(bot_id, code_dir=str(code_dir), entry_file=entry)
-        ok, msg = start_bot(bot_id)
+        context.user_data["await"] = "code_token"
+        context.user_data["code_bot_id"] = bot_id
+        await update.message.reply_text(
+            f"✅ Kod qabul qilindi, bot #{bot_id} yaratildi.\n"
+            "Endi shu kod uchun bot tokenini yuboring — token tekshirilib, shifrlab saqlanadi, "
+            "so'ng bot BOT_TOKEN env bilan ishga tushadi."
+        )
+
+    async def handle_code_token(update, context, token_text: str):
+        from telegram import Bot
+        from telegram.error import InvalidToken, NetworkError, TelegramError, TimedOut
+
+        bot_id = context.user_data.get("code_bot_id")
+        token = token_text.strip()
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+        if not bot_id:
+            await update.effective_chat.send_message("Avval kod botini tanlang — «🤖 Mening botlarim» dan «🔑 Token kiritish» ni bosing.")
+            return
+        row = get_bot(bot_id)
+        if row is None or row["owner_id"] != update.effective_user.id or row["kind"] != "code":
+            await update.effective_chat.send_message("Bot topilmadi yoki sizniki emas.")
+            return
+        if not looks_like_token(token):
+            await update.effective_chat.send_message("Token formati noto'g'ri ko'rinyapti. BotFather tokeni odatda `123456:ABC...` ko'rinishida bo'ladi.")
+            return
+        fp = token_fingerprint(token)
+        # Shu token allaqachon boshqa botda ishlatilgan bo'lsa — ikki polling to'qnashadi.
+        existing = token_hash_exists(fp)
+        if existing and row["token_hash"] != fp:
+            await update.effective_chat.send_message("Bu token bilan bot allaqachon qo'shilgan.")
+            return
+        try:
+            me = await Bot(token=token).get_me()
+        except InvalidToken:
+            await update.effective_chat.send_message("Telegram bu tokenni qabul qilmadi — token noto'g'ri yoki bekor qilingan.")
+            return
+        except (NetworkError, TimedOut):
+            await update.effective_chat.send_message("Telegramga ulanib bo'lmadi (tarmoq xatosi). Token saqlanmadi — keyinroq qayta yuboring.")
+            return
+        except TelegramError as e:
+            await update.effective_chat.send_message(f"Telegram xatosi: {e}. Token saqlanmadi.")
+            return
+        update_bot(bot_id, token_enc=encrypt_token(token), token_hash=fp,
+                   bot_username=me.username or "")
         context.user_data.pop("await", None)
-        await update.message.reply_text(f"✅ Kod qabul qilindi, bot #{bot_id} ishga tushirildi.\nHolat: {msg}\nLogni «🤖 Mening botlarim» → «📄 Log» dan ko'ring.")
+        context.user_data.pop("code_bot_id", None)
+        ok, msg = start_bot(bot_id)
+        await update.effective_chat.send_message(
+            f"✅ Bot #{bot_id} tokeni saqlandi: @{me.username}\nHolat: {msg}\n"
+            "Logni «🤖 Mening botlarim» → «📄 Log» dan ko'ring."
+        )
 
     # ---------- umumiy matn yo'naltirish ----------
 
@@ -685,6 +769,8 @@ def build_app():
         if context.user_data.get("await") == "token":
             context.user_data.pop("await", None)
             return await handle_token(update, context, text)
+        if context.user_data.get("await") == "code_token":
+            return await handle_code_token(update, context, text)
         if context.user_data.get("await") == "code":
             await update.message.reply_text("Kod kutyapman — .py yoki .zip fayl tashlang (matn emas).")
             return
