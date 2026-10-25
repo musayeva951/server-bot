@@ -1090,7 +1090,7 @@ def start_site_api_server():
 
 def build_app():
     """python-telegram-bot ilovasini yig'adi (import shu yerda — sinov importi yengil bo'lsin)."""
-    from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
     from telegram.ext import (
         ApplicationBuilder, CallbackQueryHandler, CommandHandler,
         MessageHandler, filters,
@@ -1103,11 +1103,35 @@ def build_app():
     BTN_PREMIUM = "💎 Premium olish"
     BTN_ADMIN = "🛡 Admin panel"
 
+    # Rangli panel (Bot API style, PTB 22.7+): primary=ko'k, success=yashil, danger=qizil.
+    _REPLY_COLORS = {
+        "💎 Premium olish": "success",
+        "➕ Premium berish": "success",
+        "➖ Premium olish": "danger",
+    }
+
+    def _cbtn(text: str) -> KeyboardButton:
+        return KeyboardButton(text, style=_REPLY_COLORS.get(text, "primary"))
+
+    def _colored(rows):
+        return [[_cbtn(cell) for cell in row] for row in rows]
+
+    def _ibtn(text: str, callback_data=None, url=None):
+        if "Ishga tushirish" in text or "Davom" in text or "Stars" in text:
+            style = "success"
+        elif "To'xtatish" in text or "O'chirish" in text or "o'chir" in text:
+            style = "danger"
+        else:
+            style = "primary"
+        if url is not None:
+            return InlineKeyboardButton(text, url=url, style=style)
+        return InlineKeyboardButton(text, callback_data=callback_data, style=style)
+
     def main_menu(user_id: int = 0):
         rows = [[BTN_TOKEN, BTN_CODE], [BTN_MY, BTN_PREMIUM], [BTN_HELP]]
         if user_id and is_super_admin(user_id):
             rows.append([BTN_ADMIN])
-        return ReplyKeyboardMarkup(rows, resize_keyboard=True)
+        return ReplyKeyboardMarkup(_colored(rows), resize_keyboard=True)
 
     HELP_TEXT = (
         "ℹ️ *Yordam*\n\n"
@@ -1159,19 +1183,19 @@ def build_app():
 
     def bot_buttons(bot_id: int, kind: str = "", has_token: bool = True):
         rows = [
-            [InlineKeyboardButton("▶️ Ishga tushirish", callback_data=f"act:start:{bot_id}"),
-             InlineKeyboardButton("⏹ To'xtatish", callback_data=f"act:stop:{bot_id}")],
-            [InlineKeyboardButton("📄 Log", callback_data=f"act:log:{bot_id}"),
-             InlineKeyboardButton("🗑 O'chirish", callback_data=f"act:delask:{bot_id}")],
+            [_ibtn("▶️ Ishga tushirish", callback_data=f"act:start:{bot_id}"),
+             _ibtn("⏹ To'xtatish", callback_data=f"act:stop:{bot_id}")],
+            [_ibtn("📄 Log", callback_data=f"act:log:{bot_id}"),
+             _ibtn("🗑 O'chirish", callback_data=f"act:delask:{bot_id}")],
         ]
         # Kod botiga token tugmasi har doim ko'rinadi: token yo'q bo'lsa kiritish,
         # bor bo'lsa almashtirish (masalan, token oshkor bo'lganda yangilash uchun).
         if kind == "code":
             label = "🔑 Token kiritish" if not has_token else "🔑 Token almashtirish"
-            rows.append([InlineKeyboardButton(label, callback_data=f"act:codetoken:{bot_id}")])
+            rows.append([_ibtn(label, callback_data=f"act:codetoken:{bot_id}")])
         # Kod boti: yangi kodni baza o'chmasdan almashtirish.
         if kind == "code":
-            rows.append([InlineKeyboardButton("🔄 Kod yangilash", callback_data=f"act:codeupdate:{bot_id}")])
+            rows.append([_ibtn("🔄 Kod yangilash", callback_data=f"act:codeupdate:{bot_id}")])
         return InlineKeyboardMarkup(rows)
 
     async def my_bots(update, context):
@@ -1243,8 +1267,8 @@ def build_app():
             await q.message.reply_text(f"📄 Bot #{bot_id} logi (oxirgi qatorlar):\n\n{tail}")
         elif action == "delask":
             kb = InlineKeyboardMarkup([[
-                InlineKeyboardButton("Ha, o'chir ✅", callback_data=f"act:delyes:{bot_id}"),
-                InlineKeyboardButton("Yo'q ❌", callback_data=f"act:delno:{bot_id}"),
+                _ibtn("Ha, o'chir ✅", callback_data=f"act:delyes:{bot_id}"),
+                _ibtn("Yo'q ❌", callback_data=f"act:delno:{bot_id}"),
             ]])
             await q.edit_message_text(f"Bot #{bot_id} o'chirilsinmi? Papkasi va bazasi ham o'chadi.", reply_markup=kb)
         elif action == "delyes":
@@ -1271,8 +1295,8 @@ def build_app():
             await update.message.reply_text("Server to'lgan (tekin server kuchsiz, umumiy limit bor). Keyinroq urinib ko'ring.")
             return
         kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton("🎬 Anime bot", callback_data="make:anime"),
-            InlineKeyboardButton("🎞 Kino bot", callback_data="make:movie"),
+            _ibtn("🎬 Anime bot", callback_data="make:anime"),
+            _ibtn("🎞 Kino bot", callback_data="make:movie"),
         ]])
         await update.message.reply_text(
             "Qanaqa bot yasash kerak?\n"
@@ -1296,7 +1320,7 @@ def build_app():
                 "Avval «💎 Premium olish» dan Stars bilan to'lang — to'lov avtomatik, "
                 "shu zahoti kredit ochiladi.",
                 reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton(f"⭐ {PRICE_STARS} Stars bilan to'lash", callback_data="pay:stars"),
+                    _ibtn(f"⭐ {PRICE_STARS} Stars bilan to'lash", callback_data="pay:stars"),
                 ]]),
             )
             return
@@ -1313,8 +1337,8 @@ def build_app():
         rows = []
         for key, label in MAKE_FEATURES:
             mark = "✅" if key in selected else "⬜"
-            rows.append([InlineKeyboardButton(f"{mark} {label}", callback_data=f"makefeat:{key}")])
-        rows.append([InlineKeyboardButton("➡️ Davom", callback_data="makefeat:done")])
+            rows.append([_ibtn(f"{mark} {label}", callback_data=f"makefeat:{key}")])
+        rows.append([_ibtn("➡️ Davom", callback_data="makefeat:done")])
         return InlineKeyboardMarkup(rows)
 
     async def make_feature_toggle(update, context):
@@ -1328,7 +1352,7 @@ def build_app():
                 selected = list(MAKE_FEATURE_KEYS)
                 context.user_data["make_features"] = selected
             kb = InlineKeyboardMarkup([[
-                InlineKeyboardButton(label, callback_data=f"makestyle:{key}")
+                _ibtn(label, callback_data=f"makestyle:{key}")
                 for key, label in PANEL_STYLES.items()
             ]])
             await q.edit_message_text(
@@ -1376,7 +1400,7 @@ def build_app():
         user_id = update.effective_user.id
         credits = get_credits(user_id)
         kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton(f"⭐ {PRICE_STARS} Stars bilan to'lash", callback_data="pay:stars"),
+            _ibtn(f"⭐ {PRICE_STARS} Stars bilan to'lash", callback_data="pay:stars"),
         ]])
         await update.message.reply_text(
             f"💎 Premium — 1 ta bot yasash + serverga ulash\n"
@@ -1467,7 +1491,7 @@ def build_app():
             "Premium berish uchun foydalanuvchi Telegram ID sini yuboring — "
             "avval «➕ Premium berish», olish uchun «➖ Premium olish» ni bosing.",
             reply_markup=ReplyKeyboardMarkup(
-                [["➕ Premium berish", "➖ Premium olish"], ["👥 Premiumlar", "⬅️ Orqaga"]],
+                _colored([["➕ Premium berish", "➖ Premium olish"], ["👥 Premiumlar", "⬅️ Orqaga"]]),
                 resize_keyboard=True,
             ),
         )
