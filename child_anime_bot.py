@@ -856,7 +856,8 @@ def build_app():
             anime = get_anime(anime_id)
             if anime:
                 update_anime(anime_id, is_premium=0 if anime["is_premium"] else 1)
-                await q.edit_message_text(f"⭐ Premium {'o\'chirildi' if anime['is_premium'] else 'yoqildi'}: {anime['title']}")
+                prem_word = "o'chirildi" if anime["is_premium"] else "yoqildi"
+                await q.edit_message_text(f"⭐ Premium {prem_word}: {anime['title']}")
         elif kind == "editrepep":
             if not is_owner(update):
                 return

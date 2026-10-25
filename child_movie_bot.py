@@ -770,7 +770,8 @@ def build_app():
             movie = get_movie(mid)
             if movie:
                 update_movie(mid, is_premium=0 if movie["is_premium"] else 1)
-                await q.edit_message_text(f"⭐ Premium {'o\'chirildi' if movie['is_premium'] else 'yoqildi'}: {movie['title']}")
+                prem_word = "o'chirildi" if movie["is_premium"] else "yoqildi"
+                await q.edit_message_text(f"⭐ Premium {prem_word}: {movie['title']}")
         elif kind == "editdeltrailer":
             if not is_owner(update):
                 return
