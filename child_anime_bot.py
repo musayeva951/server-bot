@@ -18,6 +18,13 @@ Imkoniyatlar (MVP, ixcham):
       qiladi va file_id ni saqlaydi. Video aynan shu botga yuborilgani
       uchun file_id shu botda ishlaydi (boshqa botdan ko'chirilgan
       file_id ishlamasligi mumkin — shuning uchun har bot o'z bazasi bilan).
+    * "🛡 Admin panel" — faqat egasiga ochiq: statistika, foydalanuvchilar
+      ro'yxati, anime o'chirish, barcha foydalanuvchilarga e'lon yuborish.
+
+  Egasi ID si avtomatik: server bot botni yaratgan odamning Telegram
+  ID sini o'zi aniqlab, OWNER_ID qilib botga beradi — egasi ID ni qo'lda
+  kiritishi shart emas. Botga kirgan har bir foydalanuvchi users jadvaliga
+  yoziladi, admin panel shundan foydalanuvchilarni ko'rsatadi.
 
 MVP ga KIRMAYDI (atay qoldirilgan): majburiy obuna, premium/to'lov,
 post kanallari, shorts, sayt API. Kerak bo'lsa keyingi versiyada qo'shiladi.
@@ -57,6 +64,51 @@ def init_db():
                          ep_no INTEGER NOT NULL,
                          title TEXT DEFAULT '',
                          file_id TEXT NOT NULL)""")
+        # Admin panel uchun: botga kirgan foydalanuvchilar (ID avtomatik).
+        c.execute("""CREATE TABLE IF NOT EXISTS users(
+                         user_id INTEGER PRIMARY KEY,
+                         username TEXT DEFAULT '',
+                         first_seen TEXT DEFAULT '')""")
+
+
+def track_user(user_id: int, username: str = ""):
+    import datetime as _dt
+    with conn() as c:
+        c.execute(
+            "INSERT OR IGNORE INTO users(user_id, username, first_seen) VALUES(?,?,?)",
+            (user_id, username or "", _dt.datetime.now().isoformat(timespec="seconds")),
+        )
+
+
+def count_users() -> int:
+    with conn() as c:
+        return c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+
+
+def list_users(limit: int = 20):
+    with conn() as c:
+        return c.execute(
+            "SELECT * FROM users ORDER BY rowid DESC LIMIT ?", (limit,)
+        ).fetchall()
+
+
+def stats_text() -> str:
+    with conn() as c:
+        n_anime = c.execute("SELECT COUNT(*) FROM animes").fetchone()[0]
+        n_ep = c.execute("SELECT COUNT(*) FROM episodes").fetchone()[0]
+    return (
+        f"📊 Statistika\n\n"
+        f"👥 Foydalanuvchilar: {count_users()} ta\n"
+        f"🎬 Animelar: {n_anime} ta\n"
+        f"🎞 Qismlar: {n_ep} ta\n"
+        f"🛡 Egasi ID: {OWNER_ID}"
+    )
+
+
+def delete_anime(anime_id: int):
+    with conn() as c:
+        c.execute("DELETE FROM episodes WHERE anime_id=?", (anime_id,))
+        c.execute("DELETE FROM animes WHERE id=?", (anime_id,))
 
 
 def list_animes(query: str = ""):
@@ -116,6 +168,7 @@ def build_app():
     BTN_LIST = "📋 Anime ro'yxati"
     BTN_ADD_ANIME = "➕ Anime qo'shish"
     BTN_ADD_EP = "🎞 Qism qo'shish"
+    BTN_ADMIN = "🛡 Admin panel"
 
     def is_owner(update) -> bool:
         return update.effective_user and update.effective_user.id == OWNER_ID
@@ -123,9 +176,61 @@ def build_app():
     def menu_for(update):
         if is_owner(update):
             return ReplyKeyboardMarkup(
-                [[BTN_LIST], [BTN_ADD_ANIME, BTN_ADD_EP]], resize_keyboard=True
+                [[BTN_LIST], [BTN_ADD_ANIME, BTN_ADD_EP], [BTN_ADMIN]], resize_keyboard=True
             )
         return ReplyKeyboardMarkup([[BTN_LIST]], resize_keyboard=True)
+
+    def admin_keyboard():
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("📊 Statistika", callback_data="admin:stats"),
+             InlineKeyboardButton("👥 Foydalanuvchilar", callback_data="admin:users")],
+            [InlineKeyboardButton("🗑 Anime o'chirish", callback_data="admin:delete"),
+             InlineKeyboardButton("📢 E'lon yuborish", callback_data="admin:broadcast")],
+        ])
+
+    async def on_admin_callback(update, context):
+        q = update.callback_query
+        await q.answer()
+        if not is_owner(update):
+            return
+        action = (q.data or "").split(":", 1)[1] if ":" in (q.data or "") else ""
+        if action == "stats":
+            await q.edit_message_text(stats_text(), reply_markup=admin_keyboard())
+        elif action == "users":
+            rows = list_users()
+            if not rows:
+                await q.edit_message_text("Hozircha foydalanuvchi yo'q.", reply_markup=admin_keyboard())
+                return
+            lines = "\n".join(
+                f"• {r['user_id']}" + (f" (@{r['username']})" if r["username"] else "")
+                for r in rows
+            )
+            await q.edit_message_text(f"👥 Oxirgi foydalanuvchilar:\n{lines}", reply_markup=admin_keyboard())
+        elif action == "delete":
+            rows = list_animes()
+            if not rows:
+                await q.edit_message_text("O'chiriladigan anime yo'q.", reply_markup=admin_keyboard())
+                return
+            kb = InlineKeyboardMarkup(
+                [[InlineKeyboardButton(f"🗑 {r['title']}", callback_data=f"delanime:{r['id']}")] for r in rows]
+            )
+            await q.edit_message_text("Qaysi anime o'chirilsin? (qismlari ham o'chadi)", reply_markup=kb)
+        elif action == "broadcast":
+            context.user_data["await"] = "broadcast"
+            await q.message.reply_text("📢 Barcha foydalanuvchilarga yuboriladigan e'lon matnini yozing:")
+
+    async def on_delete_callback(update, context):
+        q = update.callback_query
+        await q.answer()
+        if not is_owner(update):
+            return
+        try:
+            anime_id = int((q.data or "").split(":", 1)[1])
+        except (ValueError, IndexError):
+            return
+        anime = get_anime(anime_id)
+        delete_anime(anime_id)
+        await q.edit_message_text(f"🗑 O'chirildi: {anime['title'] if anime else anime_id}")
 
     def animes_keyboard(rows, prefix="anime"):
         kb = [[InlineKeyboardButton(r["title"], callback_data=f"{prefix}:{r['id']}")] for r in rows]
@@ -149,6 +254,7 @@ def build_app():
             await chat.send_message(text, reply_markup=kb)
 
     async def cmd_start(update, context):
+        track_user(update.effective_user.id, update.effective_user.username or "")
         await update.message.reply_text(
             "Assalomu alaykum! 👋 Anime tanlang yoki nomini yozib qidiring.",
             reply_markup=menu_for(update),
@@ -198,6 +304,28 @@ def build_app():
     async def handle_text(update, context):
         text = (update.message.text or "").strip()
         state = context.user_data.get("await")
+        track_user(update.effective_user.id, update.effective_user.username or "")
+        if is_owner(update) and text == BTN_ADMIN:
+            context.user_data.pop("await", None)
+            await update.message.reply_text(
+                "🛡 Admin panel\nEgasi ID avtomatik o'rnatilgan — qo'lda kiritish shart emas.",
+                reply_markup=admin_keyboard(),
+            )
+            return
+        if is_owner(update) and state == "broadcast":
+            context.user_data.pop("await", None)
+            rows = list_users()
+            sent = failed = 0
+            for r in rows:
+                if int(r["user_id"]) == OWNER_ID:
+                    continue
+                try:
+                    await context.bot.send_message(chat_id=int(r["user_id"]), text=text)
+                    sent += 1
+                except Exception:
+                    failed += 1
+            await update.message.reply_text(f"📢 E'lon yuborildi: {sent} ta yetdi, {failed} ta yetmadi.")
+            return
         if text == BTN_LIST:
             context.user_data.pop("await", None)
             return await send_anime_list(update, context)
@@ -246,6 +374,8 @@ def build_app():
 
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CallbackQueryHandler(on_admin_callback, pattern=r"^admin:"))
+    app.add_handler(CallbackQueryHandler(on_delete_callback, pattern=r"^delanime:"))
     app.add_handler(CallbackQueryHandler(on_callback, pattern=r"^(anime|ep|epadd):"))
     app.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, handle_video))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))

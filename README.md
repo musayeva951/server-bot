@@ -86,6 +86,20 @@ python3 -m py_compile server_bot.py child_anime_bot.py
 Eslatma: FadeHost bepul tarifda GitHub orqali kirishda "Confirm access"
 email tasdig'i kerak bo'lishi mumkin — uni hisob egasining o'zi o'tadi.
 
+## Yaratilgan botlardagi admin panel
+
+Server bot botni yaratgan odamning Telegram ID sini o'zi aniqlab,
+`OWNER_ID` qilib yangi botga beradi — egasi ID ni qo'lda kiritish
+shart emas. Shu ID bilan yangi botda egasiga «🛡 Admin panel» ochiladi:
+
+- 📊 Statistika (foydalanuvchilar, anime/kino, qismlar soni)
+- 👥 Foydalanuvchilar ro'yxati (botga kirganlar avtomatik yoziladi)
+- 🗑 Anime / kino o'chirish
+- 📢 Barcha foydalanuvchilarga e'lon yuborish
+
+Bu panel ham anime, ham kino shablonida bor. Server botning o'zidagi
+admin panel (super admin uchun, premium berish/olish) alohida turadi.
+
 ## Cheklovlar
 
 - Tekin server kuchsiz: **256 MB xotira, kuniga 1 GB trafik**. Shuning
