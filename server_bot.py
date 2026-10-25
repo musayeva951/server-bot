@@ -241,16 +241,32 @@ def token_hash_exists(fp: str) -> bool:
     return row is not None
 
 
-def create_bot(owner_id, kind, token_enc="", token_hash="", code_dir="", entry_file="", bot_username="", bot_type="anime"):
+def smallest_free_bot_id() -> int:
+    """O'chirilgan bot raqamini qayta ishlatish uchun eng kichik bo'sh raqam.
+
+    SQLite AUTOINCREMENT o'chirilgan id ni hech qachon qaytarmaydi, shuning
+    uchun yangi bot doim #3, #4... bo'lib ketardi. Endi bo'sh raqam qayta
+    beriladi: masalan, #1 va #2 o'chirilgan bo'lsa, keyingi bot yana #1 bo'ladi.
+    """
     with db_conn() as c:
-        cur = c.execute(
-            """INSERT INTO bots(owner_id, kind, token_enc, token_hash, code_dir,
+        used = {r[0] for r in c.execute("SELECT id FROM bots").fetchall()}
+    n = 1
+    while n in used:
+        n += 1
+    return n
+
+
+def create_bot(owner_id, kind, token_enc="", token_hash="", code_dir="", entry_file="", bot_username="", bot_type="anime"):
+    bot_id = smallest_free_bot_id()
+    with db_conn() as c:
+        c.execute(
+            """INSERT INTO bots(id, owner_id, kind, token_enc, token_hash, code_dir,
                                 entry_file, bot_username, status, created_at, bot_type)
-               VALUES(?,?,?,?,?,?,?,'stopped',?,?)""",
-            (owner_id, kind, token_enc, token_hash, code_dir, entry_file,
+               VALUES(?,?,?,?,?,?,?,?,'stopped',?,?)""",
+            (bot_id, owner_id, kind, token_enc, token_hash, code_dir, entry_file,
              bot_username, datetime.now().isoformat(timespec="seconds"), bot_type),
         )
-        return cur.lastrowid
+        return bot_id
 
 
 def update_bot(bot_id: int, **fields):
@@ -1404,7 +1420,20 @@ def build_app():
             return
         fp = token_fingerprint(token)
         if token_hash_exists(fp):
-            await update.effective_chat.send_message("Bu token bilan bot allaqachon qo'shilgan.")
+            # Token hali bazada bor degani — bot o'chirilmagan, faqat to'xtatilgan
+            # bo'lishi mumkin. Qaysi bot ekanini aytamiz, shunda foydalanuvchi
+            # avval o'sha botni o'chirib, keyin tokenni qayta ishlata oladi.
+            # O'chirilgan botning tokeni bazadan ham o'chadi, shuning uchun
+            # o'chirishdan keyin qayta ishlatish to'silmaydi.
+            with db_conn() as _c:
+                _row = _c.execute("SELECT id, owner_id FROM bots WHERE token_hash=?", (fp,)).fetchone()
+            _num = _row["id"] if _row is not None else "?"
+            await update.effective_chat.send_message(
+                f"Bu token allaqachon Bot #{_num} da ishlatilgan. "
+                "Agar o'sha botni o'chirgan bo'lsangiz, «🤖 Botlarim» dan u rostdan "
+                "o'chganini tekshiring — faqat to'xtatilgan bot tokenni band qilib turadi. "
+                "O'chirganingizdan keyin shu tokenni qayta ishlata olasiz."
+            )
             return
         try:
             me = await Bot(token=token).get_me()
@@ -1567,7 +1596,14 @@ def build_app():
         # Shu token allaqachon boshqa botda ishlatilgan bo'lsa — ikki polling to'qnashadi.
         existing = token_hash_exists(fp)
         if existing and row["token_hash"] != fp:
-            await update.effective_chat.send_message("Bu token bilan bot allaqachon qo'shilgan.")
+            with db_conn() as _c:
+                _row = _c.execute("SELECT id FROM bots WHERE token_hash=?", (fp,)).fetchone()
+            _num = _row["id"] if _row is not None else "?"
+            await update.effective_chat.send_message(
+                f"Bu token allaqachon Bot #{_num} da ishlatilgan. "
+                "Avval o'sha botni o'chiring, keyin tokenni qayta ishlata olasiz — "
+                "o'chirilgan botning tokeni bazadan ham o'chadi."
+            )
             return
         try:
             me = await Bot(token=token).get_me()
