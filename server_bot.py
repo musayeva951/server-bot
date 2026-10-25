@@ -1167,6 +1167,9 @@ def build_app():
         # Kod botiga token hali kiritilmagan bo'lsa — alohida tugma ko'rsatamiz.
         if kind == "code" and not has_token:
             rows.append([InlineKeyboardButton("🔑 Token kiritish", callback_data=f"act:codetoken:{bot_id}")])
+        # Kod boti: yangi kodni baza o'chmasdan almashtirish.
+        if kind == "code":
+            rows.append([InlineKeyboardButton("🔄 Kod yangilash", callback_data=f"act:codeupdate:{bot_id}")])
         return InlineKeyboardMarkup(rows)
 
     async def my_bots(update, context):
@@ -1200,6 +1203,18 @@ def build_app():
         row = get_bot(bot_id)
         if row is None or row["owner_id"] != q.from_user.id:
             await q.edit_message_text("Bot topilmadi yoki sizniki emas.")
+            return
+        if action == "codeupdate":
+            if row["kind"] != "code":
+                await q.edit_message_text(f"Bot #{bot_id}: kod yangilash faqat kod usulidagi botlar uchun.")
+                return
+            context.user_data["await"] = "code_update"
+            context.user_data["code_bot_id"] = bot_id
+            await q.message.reply_text(
+                f"Bot #{bot_id} uchun yangi .py faylni yuboring.\n"
+                "Baza o'chmaydi — faqat kod fayli almashtiriladi, keyin bot qayta ishga tushadi. "
+                "Avval sintaksis tekshiriladi: xato bo'lsa eski kod ishlashda davom etadi."
+            )
             return
         if action == "codetoken":
             if row["kind"] != "code":
@@ -1658,6 +1673,56 @@ def build_app():
             "so'ng bot BOT_TOKEN env bilan ishga tushadi."
         )
 
+    async def handle_code_update_doc(update, context):
+        """Kod boti yangilanishi: faqat .py, baza o'chmaydi, sintaksis avval tekshiriladi."""
+        doc = update.message.document
+        if doc is None:
+            return
+        bot_id = context.user_data.get("code_bot_id")
+        row = get_bot(bot_id) if bot_id else None
+        if row is None or row["owner_id"] != update.effective_user.id or row["kind"] != "code":
+            await update.message.reply_text("Bot topilmadi yoki sizniki emas.")
+            return
+        name = doc.file_name or ""
+        if Path(name).suffix.lower() != ".py":
+            await update.message.reply_text("Yangilash uchun faqat .py fayl yuboring (zip emas).")
+            return
+        if doc.file_size and doc.file_size > MAX_CODE_SIZE:
+            await update.message.reply_text("Fayl juda katta — limit 2 MB.")
+            return
+        code_dir = Path(row["code_dir"])
+        entry = code_dir / row["entry_file"]
+        if not entry.exists():
+            await update.message.reply_text("Eski kod fayli topilmadi — yangilab bo'lmadi.")
+            return
+        work = bot_work_dir(bot_id)
+        tmp_path = work / "update_tmp.py"
+        try:
+            tg_file = await doc.get_file()
+            await tg_file.download_to_drive(str(tmp_path))
+        except Exception as e:
+            await update.message.reply_text(f"Faylni yuklab bo'lmadi: {e}")
+            return
+        ok, msg = check_python_syntax(tmp_path)
+        if not ok:
+            tmp_path.unlink(missing_ok=True)
+            await update.message.reply_text(
+                f"Kodda sintaksis xato bor, almashtirilmadi — eski bot ishlashda davom etadi:\n{msg}"
+            )
+            return
+        stop_bot(bot_id)
+        backup = work / "entry_backup.py"
+        shutil.copyfile(entry, backup)
+        shutil.move(str(tmp_path), str(entry))
+        context.user_data.pop("await", None)
+        ok, msg = start_bot(bot_id)
+        if ok:
+            await update.message.reply_text(f"✅ Bot #{bot_id} kodi yangilandi, bot qayta ishga tushdi. Baza o'zgarmadi.")
+        else:
+            shutil.copyfile(backup, entry)
+            start_bot(bot_id)
+            await update.message.reply_text(f"Yangi kod ishga tushmadi, eski kod qaytarildi: {msg}")
+
     async def handle_code_token(update, context, token_text: str):
         from telegram import Bot
         from telegram.error import InvalidToken, NetworkError, TelegramError, TimedOut
@@ -1761,11 +1826,16 @@ def build_app():
         if context.user_data.get("await") == "code":
             await update.message.reply_text("Kod kutyapman — .py yoki .zip fayl tashlang (matn emas).")
             return
+        if context.user_data.get("await") == "code_update":
+            await update.message.reply_text("Kod yangilanishi kutyapman — yangi .py fayl tashlang (matn emas).")
+            return
         await update.message.reply_text("Menyudan tanlang 👇", reply_markup=main_menu(update.effective_user.id))
 
     async def handle_doc(update, context):
         if context.user_data.get("await") == "code":
             return await handle_code_doc(update, context)
+        if context.user_data.get("await") == "code_update":
+            return await handle_code_update_doc(update, context)
         await update.message.reply_text("Avval «📁 Bot qo'shish (kod)» tugmasini bosing, keyin fayl tashlang.")
 
     async def post_init(app):
