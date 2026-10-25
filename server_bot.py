@@ -3,10 +3,15 @@ Server bot — asosiy bot (MVP, birinchi versiya).
 
 G'oya (Umid, 2026-10-22): bitta bot "server" bo'lib ishlab turadi.
 Odamlar anime bot ochish uchun alohida server qidirib yurmaydi:
-  1-usul (token): foydalanuvchi o'z boti tokenini beradi ->
+  1-usul (token + bot turi): foydalanuvchi bot turini tanlaydi
+      (anime yoki kino), keyin o'z boti tokenini beradi ->
       server bot tokenni getMe bilan tekshiradi, shifrlab saqlaydi va
-      tayyor anime bot shablonidan (child_anime_bot.py) nusxa ishga
-      tushiradi, har bir bot uchun ALOHIDA SQLite baza bilan.
+      tanlangan shablondan (child_anime_bot.py yoki child_movie_bot.py)
+      nusxa ishga tushiradi, har bir bot uchun ALOHIDA SQLite baza bilan,
+      va shablon faylini foydalanuvchiga ham yuboradi.
+      Bot yasash pullik: 1 ta bot = 69 000 so'm / 200 ⭐ (Stars, avto).
+      To'lovdan keyin 1 premium krediti ochiladi, bot yaratilganda
+      ishlatiladi. Super admin admin paneldan premium berishi/olishi mumkin.
   2-usul (kod): foydalanuvchi o'z botining kodini (.py bitta fayl yoki
       .zip ichida bot.py/main.py) tashlaydi, keyin shu kod uchun bot
       tokenini alohida yuboradi -> server bot tokenni getMe bilan
@@ -54,12 +59,30 @@ DATA_DIR = Path(os.environ.get("DATA_DIR", str(BASE_DIR / "data")))
 DB_PATH = Path(os.environ.get("SERVER_DB_PATH", str(BASE_DIR / "server.db")))
 SERVER_BOT_TOKEN = os.environ.get("SERVER_BOT_TOKEN", "")
 SERVER_BOT_SECRET = os.environ.get("SERVER_BOT_SECRET", "")
+# Super admin (Umid) — Telegram ID si. FadeHost panelda SUPER_ADMIN_ID
+# sifatida o'rnatiladi. O'rnatilmagan bo'lsa admin panel yopiq turadi,
+# lekin Stars orqali avto to'lov va premium baribir ishlaydi.
+SUPER_ADMIN_ID = int(os.environ.get("SUPER_ADMIN_ID", "0") or 0)
+# Narx: 1 ta bot yasash + serverga ulash.
+# So'mdagi narx va Starsdagi ekvivalenti — to'lov Stars orqali olinadi,
+# yulduzlar to'g'ridan-to'g'ri shu server botining hisobiga tushadi
+# (ya'ni bot egasiga — super adminga).
+PRICE_SOM = int(os.environ.get("PRICE_SOM", "69000") or 69000)
+PRICE_STARS = int(os.environ.get("PRICE_STARS", "200") or 200)
 MAX_BOTS = int(os.environ.get("MAX_BOTS", "5") or 5)
 MAX_BOTS_PER_USER = int(os.environ.get("MAX_BOTS_PER_USER", "1") or 1)
 MAX_CODE_SIZE = int(os.environ.get("MAX_CODE_SIZE", str(2 * 1024 * 1024)) or 2 * 1024 * 1024)
 MAX_ZIP_EXTRACTED = 10 * 1024 * 1024  # zip ochilgandagi umumiy limit
 
 CHILD_SCRIPT = BASE_DIR / "child_anime_bot.py"
+CHILD_MOVIE_SCRIPT = BASE_DIR / "child_movie_bot.py"
+# Bot turi -> ishga tushadigan shablon fayli va foydalanuvchiga
+# yuboriladigan fayl (bot-maker "fayllarni tashlab beradi" sharti).
+TEMPLATE_FILES = {
+    "anime": CHILD_SCRIPT,
+    "movie": CHILD_MOVIE_SCRIPT,
+}
+TEMPLATE_NAMES = {"anime": "Anime bot", "movie": "Kino bot"}
 
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 log = logging.getLogger("server_bot")
@@ -168,6 +191,30 @@ def init_db():
         )
         c.execute("CREATE INDEX IF NOT EXISTS idx_bots_owner ON bots(owner_id)")
         c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_bots_tokenhash ON bots(token_hash) WHERE token_hash != ''")
+        # Eski bazalarda bot_type ustuni bo'lmasligi mumkin — migratsiya.
+        cols = [r[1] for r in c.execute("PRAGMA table_info(bots)").fetchall()]
+        if "bot_type" not in cols:
+            c.execute("ALTER TABLE bots ADD COLUMN bot_type TEXT DEFAULT 'anime'")
+        # Premium: har bir kredit = 1 ta bot yasash + serverga ulash huquqi.
+        # To'lov (Stars) yoki super admin berganda kredit qo'shiladi,
+        # bot muvaffaqiyatli yaratilganda 1 kredit ishlatiladi.
+        c.execute(
+            """CREATE TABLE IF NOT EXISTS premium_users(
+                   user_id INTEGER PRIMARY KEY,
+                   credits INTEGER NOT NULL DEFAULT 0,
+                   granted_at TEXT,
+                   granted_by TEXT DEFAULT '')"""
+        )
+        c.execute(
+            """CREATE TABLE IF NOT EXISTS payments(
+                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   user_id INTEGER NOT NULL,
+                   username TEXT DEFAULT '',
+                   amount_stars INTEGER NOT NULL,
+                   payload TEXT DEFAULT '',
+                   status TEXT NOT NULL DEFAULT 'paid',
+                   created_at TEXT NOT NULL)"""
+        )
 
 
 def add_user(user_id: int, username: str = ""):
@@ -194,14 +241,14 @@ def token_hash_exists(fp: str) -> bool:
     return row is not None
 
 
-def create_bot(owner_id, kind, token_enc="", token_hash="", code_dir="", entry_file="", bot_username=""):
+def create_bot(owner_id, kind, token_enc="", token_hash="", code_dir="", entry_file="", bot_username="", bot_type="anime"):
     with db_conn() as c:
         cur = c.execute(
             """INSERT INTO bots(owner_id, kind, token_enc, token_hash, code_dir,
-                                entry_file, bot_username, status, created_at)
-               VALUES(?,?,?,?,?,?,?,'stopped',?)""",
+                                entry_file, bot_username, status, created_at, bot_type)
+               VALUES(?,?,?,?,?,?,?,'stopped',?,?)""",
             (owner_id, kind, token_enc, token_hash, code_dir, entry_file,
-             bot_username, datetime.now().isoformat(timespec="seconds")),
+             bot_username, datetime.now().isoformat(timespec="seconds"), bot_type),
         )
         return cur.lastrowid
 
@@ -232,6 +279,78 @@ def get_all_bots():
 def delete_bot_row(bot_id: int):
     with db_conn() as c:
         c.execute("DELETE FROM bots WHERE id=?", (bot_id,))
+
+
+# ---------------------------------------------------------------- premium / to'lov
+
+def is_super_admin(user_id: int) -> bool:
+    return bool(SUPER_ADMIN_ID) and int(user_id) == SUPER_ADMIN_ID
+
+
+def get_credits(user_id: int) -> int:
+    if is_super_admin(user_id):
+        return 999  # super admin uchun cheksiz deb ko'rsatiladi
+    with db_conn() as c:
+        row = c.execute("SELECT credits FROM premium_users WHERE user_id=?", (user_id,)).fetchone()
+        return int(row["credits"]) if row else 0
+
+
+def has_premium(user_id: int) -> bool:
+    return is_super_admin(user_id) or get_credits(user_id) > 0
+
+
+def grant_credit(user_id: int, by: str = "admin", amount: int = 1) -> int:
+    now = datetime.now().isoformat(timespec="seconds")
+    with db_conn() as c:
+        c.execute(
+            """INSERT INTO premium_users(user_id, credits, granted_at, granted_by)
+               VALUES(?,?,?,?)
+               ON CONFLICT(user_id) DO UPDATE SET
+                 credits = premium_users.credits + excluded.credits,
+                 granted_at = excluded.granted_at, granted_by = excluded.granted_by""",
+            (user_id, amount, now, by),
+        )
+        row = c.execute("SELECT credits FROM premium_users WHERE user_id=?", (user_id,)).fetchone()
+        return int(row["credits"])
+
+
+def revoke_premium(user_id: int) -> None:
+    with db_conn() as c:
+        c.execute("DELETE FROM premium_users WHERE user_id=?", (user_id,))
+
+
+def use_credit(user_id: int) -> bool:
+    """Bot yaratilganda 1 kredit ishlatadi. Super admin uchun kerak emas."""
+    if is_super_admin(user_id):
+        return True
+    with db_conn() as c:
+        row = c.execute("SELECT credits FROM premium_users WHERE user_id=?", (user_id,)).fetchone()
+        if not row or int(row["credits"]) <= 0:
+            return False
+        c.execute("UPDATE premium_users SET credits = credits - 1 WHERE user_id=?", (user_id,))
+        return True
+
+
+def record_payment(user_id: int, username: str, amount_stars: int, payload: str = "") -> None:
+    with db_conn() as c:
+        c.execute(
+            "INSERT INTO payments(user_id, username, amount_stars, payload, created_at)"
+            " VALUES(?,?,?,?,?)",
+            (user_id, username or "", amount_stars, payload,
+             datetime.now().isoformat(timespec="seconds")),
+        )
+
+
+def list_premium_users():
+    with db_conn() as c:
+        return c.execute(
+            "SELECT * FROM premium_users WHERE credits > 0 ORDER BY user_id"
+        ).fetchall()
+
+
+def count_premium_users() -> int:
+    with db_conn() as c:
+        return c.execute("SELECT COUNT(*) FROM premium_users WHERE credits > 0").fetchone()[0]
 
 
 # ---------------------------------------------------------------- jarayon boshqaruvi
@@ -302,7 +421,11 @@ def start_bot(bot_id: int) -> tuple[bool, str]:
             return False, f"Tokenni ochib bo'lmadi: {e}"
         if not token:
             return False, "Token saqlanmagan"
-        script = CHILD_SCRIPT
+        # Bot turi bo'yicha shablon: anime -> child_anime_bot.py,
+        # kino -> child_movie_bot.py. Eski qatorlarda bot_type bo'sh
+        # bo'lsa, anime deb qabul qilinadi.
+        bot_type = (row["bot_type"] if "bot_type" in row.keys() else None) or "anime"
+        script = TEMPLATE_FILES.get(bot_type, CHILD_SCRIPT)
         env = _clean_env({
             "CHILD_BOT_TOKEN": token,
             "CHILD_DB_PATH": str(work / "child.db"),
@@ -939,23 +1062,34 @@ def build_app():
         MessageHandler, filters,
     )
 
-    BTN_TOKEN = "➕ Bot qo'shish (token)"
+    BTN_TOKEN = "➕ Bot yasash (token)"
     BTN_CODE = "📁 Bot qo'shish (kod)"
     BTN_MY = "🤖 Mening botlarim"
     BTN_HELP = "ℹ️ Yordam"
+    BTN_PREMIUM = "💎 Premium olish"
+    BTN_ADMIN = "🛡 Admin panel"
 
-    def main_menu():
-        return ReplyKeyboardMarkup(
-            [[BTN_TOKEN, BTN_CODE], [BTN_MY, BTN_HELP]],
-            resize_keyboard=True,
-        )
+    def main_menu(user_id: int = 0):
+        rows = [[BTN_TOKEN, BTN_CODE], [BTN_MY, BTN_PREMIUM], [BTN_HELP]]
+        if user_id and is_super_admin(user_id):
+            rows.append([BTN_ADMIN])
+        return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
     HELP_TEXT = (
         "ℹ️ *Yordam*\n\n"
-        "Bu bot — server bot: botingizni tekin serverda ishlab turishi uchun ishlatiladi, "
-        "alohida server qidirib yurmaysiz.\n\n"
-        "*1-usul — token:* «➕ Bot qo'shish (token)» ni bosing va BotFather bergan tokenni yuboring. "
-        "Shu token bilan tayyor anime bot nusxasi ishga tushadi: o'z katalogingiz, alohida baza.\n\n"
+        "Bu bot — bot-maker + server bot: botingizni shu yerda yasab, "
+        "shu serverda ishga tushirib beraman, alohida server qidirib yurmaysiz.\n\n"
+        "*Bot yasash — pullik:* 1 ta bot yasash + serverga ulash — "
+        f"{PRICE_SOM:,} so'm / {PRICE_STARS} ⭐ (Telegram Stars). "
+        "To'lov avtomatik: Stars bilan to'lasangiz, shu zahoti premium kreditingiz "
+        "ochiladi va bot yasay olasiz. Yulduzlar to'g'ridan-to'g'ri shu botning "
+        "hisobiga, ya'ni super adminga tushadi.\n\n"
+        "*1-usul — token + bot turi:* «➕ Bot yasash (token)» ni bosing, "
+        "«🎬 Anime bot» yoki «🎞 Kino bot» ni tanlang, keyin BotFather bergan "
+        "tokenni yuboring. Shu token bilan tayyor shablon nusxasi ishga tushadi, "
+        "o'z katalogingiz, alohida baza — va shablon fayli ham sizga yuboriladi.\n\n"
+        "*Anime bot:* anime ro'yxati, qidiruv, qismlar, video tomosha.\n"
+        "*Kino bot:* kinolar ro'yxati, qidiruv, bitta film — bitta video.\n\n"
         "*2-usul — kod:* «📁 Bot qo'shish (kod)» ni bosib, botingiz kodini (.py fayl yoki ichida "
         "bot.py/main.py bor .zip) tashlang, keyin shu kod uchun bot tokenini yuboring. Token getMe bilan "
         "tekshirilib, shifrlab saqlanadi va ishga tushirishda BOT_TOKEN env orqali kodga beriladi. "
@@ -969,10 +1103,19 @@ def build_app():
     async def cmd_start(update, context):
         user = update.effective_user
         add_user(user.id, user.username or "")
+        credits = get_credits(user.id)
+        credit_line = ""
+        if is_super_admin(user.id):
+            credit_line = "\n🛡 Siz super admins — premium cheksiz."
+        elif credits > 0:
+            credit_line = f"\n💎 Premium kreditingiz: {credits} ta bot."
         await update.message.reply_text(
-            "Assalomu alaykum! 👋 Bu — server bot.\n"
-            "Botingizni tekin serverda ishga tushirib beraman: token bering yoki kod tashlang.",
-            reply_markup=main_menu(),
+            "Assalomu alaykum! 👋 Bu — bot-maker + server bot.\n"
+            "Token bering, bot turini ayting — anime botmi, kino botmi — "
+            "shunaqa bot yasab, shu serverga ulab beraman, faylini ham tashlab beraman.\n"
+            f"💰 1 ta bot: {PRICE_SOM:,} so'm / {PRICE_STARS} ⭐."
+            + credit_line,
+            reply_markup=main_menu(user.id),
         )
 
     async def show_help(update, context):
@@ -1004,8 +1147,12 @@ def build_app():
             status = "▶️ ishlayapti" if row["status"] == "running" and is_running(row["id"]) else "⏹ to'xtagan"
             kind = "token" if row["kind"] == "token" else "kod"
             name = f"@{row['bot_username']}" if row["bot_username"] else "(kod usuli)"
+            btype = ""
+            if row["kind"] == "token":
+                bt = (row["bot_type"] if "bot_type" in row.keys() else None) or "anime"
+                btype = f"\nTuri: {TEMPLATE_NAMES.get(bt, bt)}"
             await update.message.reply_text(
-                f"🤖 Bot #{row['id']} — {name}\nUsul: {kind}\nHolat: {status}\nYaratilgan: {row['created_at']}",
+                f"🤖 Bot #{row['id']} — {name}\nUsul: {kind}{btype}\nHolat: {status}\nYaratilgan: {row['created_at']}",
                 reply_markup=bot_buttons(row["id"], kind=row["kind"], has_token=bool(row["token_enc"])),
             )
 
@@ -1060,18 +1207,186 @@ def build_app():
     # ---------- 1-usul: token ----------
 
     async def ask_token(update, context):
+        """Bot yasash: avval turini tanlash (anime / kino)."""
         if count_bots_user(update.effective_user.id) >= MAX_BOTS_PER_USER:
             await update.message.reply_text(f"Limit: hozircha har foydalanuvchiga {MAX_BOTS_PER_USER} ta bot. Avval eskisini o'chiring.")
             return
         if count_bots_total() >= MAX_BOTS:
             await update.message.reply_text("Server to'lgan (tekin server kuchsiz, umumiy limit bor). Keyinroq urinib ko'ring.")
             return
-        context.user_data["await"] = "token"
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🎬 Anime bot", callback_data="make:anime"),
+            InlineKeyboardButton("🎞 Kino bot", callback_data="make:movie"),
+        ]])
         await update.message.reply_text(
+            "Qanaqa bot yasash kerak?\n"
+            "🎬 Anime bot — Uzbek_animelar_olami ga o'xshagan: anime ro'yxati, qismlar.\n"
+            "🎞 Kino bot — kinolar ro'yxati, har bir film bitta video.",
+            reply_markup=kb,
+        )
+
+    async def make_choice(update, context):
+        """Inline tur tanlash: premium tekshiruv, keyin token so'rash."""
+        q = update.callback_query
+        await q.answer()
+        bot_type = q.data.split(":", 1)[1]
+        if bot_type not in TEMPLATE_NAMES:
+            await q.edit_message_text("Noma'lum bot turi.")
+            return
+        user_id = q.from_user.id
+        if not has_premium(user_id):
+            await q.edit_message_text(
+                f"💎 Bot yasash pullik: 1 ta bot — {PRICE_SOM:,} so'm / {PRICE_STARS} ⭐.\n"
+                "Avval «💎 Premium olish» dan Stars bilan to'lang — to'lov avtomatik, "
+                "shu zahoti kredit ochiladi.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton(f"⭐ {PRICE_STARS} Stars bilan to'lash", callback_data="pay:stars"),
+                ]]),
+            )
+            return
+        context.user_data["make_type"] = bot_type
+        context.user_data["await"] = "token"
+        await q.message.reply_text(
+            f"{TEMPLATE_NAMES[bot_type]} yasaymiz.\n"
             "BotFather bergan tokenni yuboring.\n"
-            "Token tekshiriladi (getMe), shifrlab saqlanadi va shu zahoti anime bot nusxasi ishga tushadi.\n"
+            "Token tekshiriladi (getMe), shifrlab saqlanadi, shu zahoti bot ishga "
+            "tushadi va shablon fayli ham sizga yuboriladi.\n"
             "Token logga yozilmaydi."
         )
+
+    async def show_premium(update, context):
+        user_id = update.effective_user.id
+        credits = get_credits(user_id)
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton(f"⭐ {PRICE_STARS} Stars bilan to'lash", callback_data="pay:stars"),
+        ]])
+        await update.message.reply_text(
+            f"💎 Premium — 1 ta bot yasash + serverga ulash\n"
+            f"Narxi: {PRICE_SOM:,} so'm / {PRICE_STARS} ⭐ (Telegram Stars)\n"
+            f"Sizning kreditingiz: {'cheksiz (super admin)' if is_super_admin(user_id) else str(credits) + ' ta bot'}\n\n"
+            "To'lov avtomatik: Stars bilan to'lasangiz, shu zahoti kredit ochiladi, "
+            "keyin «➕ Bot yasash (token)» dan bot yasay olasiz.\n"
+            "Yulduzlar to'g'ridan-to'g'ri shu botning hisobiga tushadi.",
+            reply_markup=kb,
+        )
+
+    async def pay_stars(update, context):
+        """Stars invoysini yuborish (avto to'lov)."""
+        from telegram import LabeledPrice
+
+        q = update.callback_query
+        await q.answer()
+        try:
+            await context.bot.send_invoice(
+                chat_id=q.message.chat_id,
+                title="Premium — 1 ta bot",
+                description=(
+                    f"Server botda 1 ta bot yasash + serverga ulash. "
+                    f"Narxi: {PRICE_SOM:,} so'm / {PRICE_STARS} ⭐."
+                ),
+                payload="premium-1bot",
+                provider_token="",  # Telegram Stars uchun bo'sh bo'ladi
+                currency="XTR",
+                prices=[LabeledPrice("Premium — 1 ta bot", PRICE_STARS)],
+            )
+        except Exception as e:
+            await q.message.reply_text(f"To'lov invoysini yuborib bo'lmadi: {e}")
+
+    async def precheckout(update, context):
+        q = update.pre_checkout_query
+        if q.invoice_payload != "premium-1bot":
+            await q.answer(ok=False, error_message="Noma'lum to'lov.")
+            return
+        if q.currency != "XTR" or q.total_amount != PRICE_STARS:
+            await q.answer(ok=False, error_message="To'lov summasi noto'g'ri.")
+            return
+        await q.answer(ok=True)
+
+    async def successful_payment(update, context):
+        pay = update.message.successful_payment
+        user = update.effective_user
+        if pay is None or pay.invoice_payload != "premium-1bot":
+            return
+        record_payment(user.id, user.username or "", pay.total_amount, pay.invoice_payload)
+        credits = grant_credit(user.id, by="stars")
+        await update.message.reply_text(
+            f"✅ To'lov qabul qilindi: {pay.total_amount} ⭐\n"
+            f"💎 Premium kreditingiz endi: {credits} ta bot.\n"
+            "Endi «➕ Bot yasash (token)» dan bot turini tanlab, token yuboring.",
+            reply_markup=main_menu(user.id),
+        )
+        if SUPER_ADMIN_ID:
+            try:
+                await context.bot.send_message(
+                    chat_id=SUPER_ADMIN_ID,
+                    text=f"💰 Yangi Stars to'lovi: @{user.username or user.id} ({user.id}) — "
+                         f"{pay.total_amount} ⭐, kredit: {credits} ta bot.",
+                )
+            except Exception:
+                pass
+
+    # ---------- admin panel (faqat super admin) ----------
+
+    async def show_admin(update, context):
+        user_id = update.effective_user.id
+        if not is_super_admin(user_id):
+            if not SUPER_ADMIN_ID:
+                await update.message.reply_text(
+                    "🛡 Admin panel faqat super adminga ochiq.\n"
+                    "Hozir SUPER_ADMIN_ID FadeHost panelda o'rnatilmagan — "
+                    "Umid o'z Telegram ID sini (@userinfobot dan olib) "
+                    "FadeHost lekin-server-bot panelida SUPER_ADMIN_ID ga yozishi kerak."
+                )
+            else:
+                await update.message.reply_text("🛡 Admin panel faqat super adminga ochiq.")
+            return
+        rows = list_premium_users()
+        lines = "\n".join(f"• {r['user_id']} — {r['credits']} ta kredit" for r in rows) or "Hozircha premium foydalanuvchi yo'q."
+        await update.message.reply_text(
+            "🛡 Admin panel (super admin)\n\n"
+            f"👥 Premium foydalanuvchilar ({len(rows)}):\n{lines}\n\n"
+            f"📊 Jami botlar: {count_bots_total()} / {MAX_BOTS}\n"
+            "Premium berish uchun foydalanuvchi Telegram ID sini yuboring — "
+            "avval «➕ Premium berish», olish uchun «➖ Premium olish» ni bosing.",
+            reply_markup=ReplyKeyboardMarkup(
+                [["➕ Premium berish", "➖ Premium olish"], ["👥 Premiumlar", "⬅️ Orqaga"]],
+                resize_keyboard=True,
+            ),
+        )
+
+    async def admin_list(update, context):
+        rows = list_premium_users()
+        lines = "\n".join(f"• {r['user_id']} — {r['credits']} ta kredit" for r in rows) or "Hozircha premium foydalanuvchi yo'q."
+        await update.message.reply_text(f"👥 Premium foydalanuvchilar:\n{lines}")
+
+    async def handle_admin_id(update, context, text: str):
+        """Admin grant/revoke: matn sifatida Telegram ID kutiladi."""
+        mode = context.user_data.get("await")
+        try:
+            target = int(text.strip())
+        except ValueError:
+            await update.message.reply_text("Telegram ID raqam bo'lishi kerak, masalan: 123456789")
+            return
+        context.user_data.pop("await", None)
+        if mode == "admin_grant":
+            credits = grant_credit(target, by="admin")
+            await update.message.reply_text(f"✅ {target} ga premium berildi. Krediti endi: {credits} ta bot.")
+            try:
+                await context.bot.send_message(
+                    chat_id=target,
+                    text="💎 Sizga server botda premium berildi — endi 1 ta bot yasay olasiz.",
+                )
+            except Exception:
+                pass
+        elif mode == "admin_revoke":
+            revoke_premium(target)
+            await update.message.reply_text(f"✅ {target} dan premium olindi (krediti 0 ga tushirildi).")
+            try:
+                await context.bot.send_message(
+                    chat_id=target, text="💎 Server botdagi premiumingiz olindi.",
+                )
+            except Exception:
+                pass
 
     async def handle_token(update, context, token_text: str):
         from telegram import Bot
@@ -1101,17 +1416,43 @@ def build_app():
         except TelegramError as e:
             await update.effective_chat.send_message(f"Telegram xatosi: {e}. Token saqlanmadi.")
             return
+        bot_type = context.user_data.pop("make_type", "anime")
+        if bot_type not in TEMPLATE_NAMES:
+            bot_type = "anime"
+        # Premium krediti shu yerda ishlatiladi — faqat muvaffaqiyatli
+        # token tekshiruvidan keyin, bot yaratilishidan oldin.
+        if not use_credit(update.effective_user.id):
+            await update.effective_chat.send_message(
+                f"💎 Premium kreditingiz tugagan. 1 ta bot — {PRICE_SOM:,} so'm / {PRICE_STARS} ⭐. "
+                "«💎 Premium olish» dan to'lang, keyin qayta urinib ko'ring."
+            )
+            return
         bot_id = create_bot(
             owner_id=update.effective_user.id, kind="token",
             token_enc=encrypt_token(token), token_hash=fp,
-            bot_username=me.username or "",
+            bot_username=me.username or "", bot_type=bot_type,
         )
         bot_work_dir(bot_id).mkdir(parents=True, exist_ok=True)
         ok, msg = start_bot(bot_id)
+        add_text = "anime va qism" if bot_type == "anime" else "kino"
         await update.effective_chat.send_message(
-            f"✅ Bot qo'shildi: @{me.username}\nHolat: {msg}\n"
-            "Endi o'sha botga kiring: egasi sifatida siz anime va qism qo'sha olasiz."
+            f"✅ {TEMPLATE_NAMES[bot_type]} qo'shildi: @{me.username}\nHolat: {msg}\n"
+            f"Endi o'sha botga kiring: egasi sifatida siz {add_text} qo'sha olasiz.\n"
+            "Bot fayli ham quyida — o'zingizda saqlang, serverda ham shu fayl ishlayapti."
         )
+        # Bot-maker sharti: shablon faylini foydalanuvchiga tashlab berish.
+        template_path = TEMPLATE_FILES.get(bot_type)
+        if template_path and template_path.exists():
+            try:
+                with open(template_path, "rb") as f:
+                    await context.bot.send_document(
+                        chat_id=update.effective_chat.id,
+                        document=f,
+                        filename=template_path.name,
+                        caption=f"📁 {TEMPLATE_NAMES[bot_type]} shablon fayli — Bot #{bot_id}",
+                    )
+            except Exception:
+                pass
 
     # ---------- 2-usul: kod ----------
 
@@ -1121,6 +1462,12 @@ def build_app():
             return
         if count_bots_total() >= MAX_BOTS:
             await update.message.reply_text("Server to'lgan (tekin server kuchsiz, umumiy limit bor). Keyinroq urinib ko'ring.")
+            return
+        if not has_premium(update.effective_user.id):
+            await update.message.reply_text(
+                f"💎 Bot qo'shish pullik: 1 ta bot — {PRICE_SOM:,} so'm / {PRICE_STARS} ⭐.\n"
+                "Avval «💎 Premium olish» dan Stars bilan to'lang — to'lov avtomatik.",
+            )
             return
         context.user_data["await"] = "code"
         await update.message.reply_text(
@@ -1178,6 +1525,14 @@ def build_app():
             await update.message.reply_text(f"Kodda sintaksis xato bor, qabul qilinmadi:\n{msg}")
             return
         update_bot(bot_id, code_dir=str(code_dir), entry_file=entry)
+        if not use_credit(update.effective_user.id):
+            delete_bot_row(bot_id)
+            shutil.rmtree(work, ignore_errors=True)
+            await update.message.reply_text(
+                f"💎 Premium kreditingiz tugagan. 1 ta bot — {PRICE_SOM:,} so'm / {PRICE_STARS} ⭐. "
+                "«💎 Premium olish» dan to'lang, keyin kodni qayta tashlang."
+            )
+            return
         context.user_data["await"] = "code_token"
         context.user_data["code_bot_id"] = bot_id
         await update.message.reply_text(
@@ -1245,6 +1600,35 @@ def build_app():
             return await my_bots(update, context)
         if text == BTN_HELP:
             return await show_help(update, context)
+        if text == BTN_PREMIUM:
+            return await show_premium(update, context)
+        if text == BTN_ADMIN:
+            return await show_admin(update, context)
+        if text == "➕ Premium berish":
+            if not is_super_admin(update.effective_user.id):
+                await update.message.reply_text("Faqat super admin premium bera oladi.")
+                return
+            context.user_data["await"] = "admin_grant"
+            await update.message.reply_text("Premium beriladigan foydalanuvchi Telegram ID sini yuboring:")
+            return
+        if text == "➖ Premium olish":
+            if not is_super_admin(update.effective_user.id):
+                await update.message.reply_text("Faqat super admin premium ola oladi.")
+                return
+            context.user_data["await"] = "admin_revoke"
+            await update.message.reply_text("Premium olinadigan foydalanuvchi Telegram ID sini yuboring:")
+            return
+        if text == "👥 Premiumlar":
+            if not is_super_admin(update.effective_user.id):
+                await update.message.reply_text("Faqat super admin ko'ra oladi.")
+                return
+            return await admin_list(update, context)
+        if text == "⬅️ Orqaga":
+            context.user_data.pop("await", None)
+            await update.message.reply_text("Asosiy menyu 👇", reply_markup=main_menu(update.effective_user.id))
+            return
+        if context.user_data.get("await") in ("admin_grant", "admin_revoke"):
+            return await handle_admin_id(update, context, text)
         if context.user_data.get("await") == "token":
             context.user_data.pop("await", None)
             return await handle_token(update, context, text)
@@ -1253,7 +1637,7 @@ def build_app():
         if context.user_data.get("await") == "code":
             await update.message.reply_text("Kod kutyapman — .py yoki .zip fayl tashlang (matn emas).")
             return
-        await update.message.reply_text("Menyudan tanlang 👇", reply_markup=main_menu())
+        await update.message.reply_text("Menyudan tanlang 👇", reply_markup=main_menu(update.effective_user.id))
 
     async def handle_doc(update, context):
         if context.user_data.get("await") == "code":
@@ -1265,9 +1649,15 @@ def build_app():
         restore_running_bots()
         log.info("Server bot ishga tushdi, faol botlar qayta yoqildi")
 
+    from telegram.ext import PreCheckoutQueryHandler
+
     app = ApplicationBuilder().token(SERVER_BOT_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CallbackQueryHandler(bot_action, pattern=r"^act:"))
+    app.add_handler(CallbackQueryHandler(make_choice, pattern=r"^make:"))
+    app.add_handler(CallbackQueryHandler(pay_stars, pattern=r"^pay:"))
+    app.add_handler(PreCheckoutQueryHandler(precheckout))
+    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_doc))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     return app
