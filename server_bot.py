@@ -83,6 +83,18 @@ TEMPLATE_FILES = {
     "movie": CHILD_MOVIE_SCRIPT,
 }
 TEMPLATE_NAMES = {"anime": "Anime bot", "movie": "Kino bot"}
+# Bot yaratish so'rovnomasi: foydalanuvchi qaysi funksiyalar qo'shilishini
+# tanlaydi, keyin panel uslubini tanlaydi. Tanlov bots jadvalida saqlanadi
+# va bola botga env orqali beriladi (CHILD_FEATURES, PANEL_STYLE).
+MAKE_FEATURES = [
+    ("shorts", "🎬 Shortlar / Treylerlar"),
+    ("premium", "⭐ Premium"),
+    ("sub", "📺 Majburiy obuna"),
+    ("post", "📤 Post kanallari"),
+    ("storage", "📦 Saqlash kanali"),
+]
+MAKE_FEATURE_KEYS = [k for k, _ in MAKE_FEATURES]
+PANEL_STYLES = {"colorful": "🌈 Rangli", "simple": "✨ Oddiy", "minimal": "🌑 Minimal"}
 
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 log = logging.getLogger("server_bot")
@@ -195,6 +207,10 @@ def init_db():
         cols = [r[1] for r in c.execute("PRAGMA table_info(bots)").fetchall()]
         if "bot_type" not in cols:
             c.execute("ALTER TABLE bots ADD COLUMN bot_type TEXT DEFAULT 'anime'")
+        if "bot_features" not in cols:
+            c.execute("ALTER TABLE bots ADD COLUMN bot_features TEXT DEFAULT 'shorts,premium,sub,post,storage'")
+        if "panel_style" not in cols:
+            c.execute("ALTER TABLE bots ADD COLUMN panel_style TEXT DEFAULT 'simple'")
         # Premium: har bir kredit = 1 ta bot yasash + serverga ulash huquqi.
         # To'lov (Stars) yoki super admin berganda kredit qo'shiladi,
         # bot muvaffaqiyatli yaratilganda 1 kredit ishlatiladi.
@@ -256,15 +272,15 @@ def smallest_free_bot_id() -> int:
     return n
 
 
-def create_bot(owner_id, kind, token_enc="", token_hash="", code_dir="", entry_file="", bot_username="", bot_type="anime"):
+def create_bot(owner_id, kind, token_enc="", token_hash="", code_dir="", entry_file="", bot_username="", bot_type="anime", bot_features="shorts,premium,sub,post,storage", panel_style="simple"):
     bot_id = smallest_free_bot_id()
     with db_conn() as c:
         c.execute(
             """INSERT INTO bots(id, owner_id, kind, token_enc, token_hash, code_dir,
-                                entry_file, bot_username, status, created_at, bot_type)
-               VALUES(?,?,?,?,?,?,?,?,'stopped',?,?)""",
+                                entry_file, bot_username, status, created_at, bot_type, bot_features, panel_style)
+               VALUES(?,?,?,?,?,?,?,?,'stopped',?,?,?,?)""",
             (bot_id, owner_id, kind, token_enc, token_hash, code_dir, entry_file,
-             bot_username, datetime.now().isoformat(timespec="seconds"), bot_type),
+             bot_username, datetime.now().isoformat(timespec="seconds"), bot_type, bot_features, panel_style),
         )
         return bot_id
 
@@ -446,6 +462,8 @@ def start_bot(bot_id: int) -> tuple[bool, str]:
             "CHILD_BOT_TOKEN": token,
             "CHILD_DB_PATH": str(work / "child.db"),
             "OWNER_ID": str(row["owner_id"]),
+            "CHILD_FEATURES": (row["bot_features"] if "bot_features" in row.keys() and row["bot_features"] else "shorts,premium,sub,post,storage"),
+            "PANEL_STYLE": (row["panel_style"] if "panel_style" in row.keys() and row["panel_style"] else "simple"),
         })
         cwd = work
     else:  # kind == 'code'
@@ -1167,6 +1185,8 @@ def build_app():
             if row["kind"] == "token":
                 bt = (row["bot_type"] if "bot_type" in row.keys() else None) or "anime"
                 btype = f"\nTuri: {TEMPLATE_NAMES.get(bt, bt)}"
+                if "panel_style" in row.keys() and row["panel_style"]:
+                    btype += f"\nPanel: {PANEL_STYLES.get(row['panel_style'], row['panel_style'])}"
             await update.message.reply_text(
                 f"🤖 Bot #{row['id']} — {name}\nUsul: {kind}{btype}\nHolat: {status}\nYaratilgan: {row['created_at']}",
                 reply_markup=bot_buttons(row["id"], kind=row["kind"], has_token=bool(row["token_enc"])),
@@ -1262,9 +1282,71 @@ def build_app():
             )
             return
         context.user_data["make_type"] = bot_type
+        context.user_data["make_features"] = list(MAKE_FEATURE_KEYS)
+        await q.edit_message_text(
+            f"{TEMPLATE_NAMES[bot_type]} yasaymiz.\n"
+            "Botga nimalar qo'shilsin? Keraklisini belgilang, keraksizini o'chiring, "
+            "keyin «➡️ Davom» ni bosing:",
+            reply_markup=features_keyboard(context.user_data["make_features"]),
+        )
+
+    def features_keyboard(selected):
+        rows = []
+        for key, label in MAKE_FEATURES:
+            mark = "✅" if key in selected else "⬜"
+            rows.append([InlineKeyboardButton(f"{mark} {label}", callback_data=f"makefeat:{key}")])
+        rows.append([InlineKeyboardButton("➡️ Davom", callback_data="makefeat:done")])
+        return InlineKeyboardMarkup(rows)
+
+    async def make_feature_toggle(update, context):
+        """Funksiya tanlash: belgilash/o'chirish, keyin panel uslubi."""
+        q = update.callback_query
+        await q.answer()
+        action = q.data.split(":", 1)[1]
+        selected = context.user_data.get("make_features", list(MAKE_FEATURE_KEYS))
+        if action == "done":
+            if not selected:
+                selected = list(MAKE_FEATURE_KEYS)
+                context.user_data["make_features"] = selected
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton(label, callback_data=f"makestyle:{key}")
+                for key, label in PANEL_STYLES.items()
+            ]])
+            await q.edit_message_text(
+                "Panel qanaqa bo'lsin?\n"
+                "🌈 Rangli — emoji ko'p, chiroyli sarlavhalar.\n"
+                "✨ Oddiy — hozirgi ko'rinish.\n"
+                "🌑 Minimal — emoji kam, sodda tugmalar.",
+                reply_markup=kb,
+            )
+            return
+        if action in MAKE_FEATURE_KEYS:
+            if action in selected:
+                selected.remove(action)
+            else:
+                selected.append(action)
+            context.user_data["make_features"] = selected
+            await q.edit_message_text(
+                "Botga nimalar qo'shilsin? Keraklisini belgilang, keraksizini o'chiring, "
+                "keyin «➡️ Davom» ni bosing:",
+                reply_markup=features_keyboard(selected),
+            )
+
+    async def make_style_choice(update, context):
+        """Panel uslubi tanlash: keyin token so'rash."""
+        q = update.callback_query
+        await q.answer()
+        style = q.data.split(":", 1)[1]
+        if style not in PANEL_STYLES:
+            style = "colorful"
+        context.user_data["make_style"] = style
         context.user_data["await"] = "token"
+        bot_type = context.user_data.get("make_type", "anime")
+        feats = ", ".join(label for key, label in MAKE_FEATURES if key in context.user_data.get("make_features", [])) or "hammasi"
         await q.message.reply_text(
             f"{TEMPLATE_NAMES[bot_type]} yasaymiz.\n"
+            f"Tanlangan funksiyalar: {feats}\n"
+            f"Panel uslubi: {PANEL_STYLES[style]}\n"
             "BotFather bergan tokenni yuboring.\n"
             "Token tekshiriladi (getMe), shifrlab saqlanadi, shu zahoti bot ishga "
             "tushadi va shablon fayli ham sizga yuboriladi.\n"
@@ -1457,10 +1539,14 @@ def build_app():
                 "«💎 Premium olish» dan to'lang, keyin qayta urinib ko'ring."
             )
             return
+        feats = context.user_data.pop("make_features", list(MAKE_FEATURE_KEYS))
+        style = context.user_data.pop("make_style", "colorful")
         bot_id = create_bot(
             owner_id=update.effective_user.id, kind="token",
             token_enc=encrypt_token(token), token_hash=fp,
             bot_username=me.username or "", bot_type=bot_type,
+            bot_features=",".join(feats) if feats else "shorts,premium,sub,post,storage",
+            panel_style=style if style in PANEL_STYLES else "colorful",
         )
         bot_work_dir(bot_id).mkdir(parents=True, exist_ok=True)
         ok, msg = start_bot(bot_id)
@@ -1693,6 +1779,8 @@ def build_app():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CallbackQueryHandler(bot_action, pattern=r"^act:"))
     app.add_handler(CallbackQueryHandler(make_choice, pattern=r"^make:"))
+    app.add_handler(CallbackQueryHandler(make_feature_toggle, pattern=r"^makefeat:"))
+    app.add_handler(CallbackQueryHandler(make_style_choice, pattern=r"^makestyle:"))
     app.add_handler(CallbackQueryHandler(pay_stars, pattern=r"^pay:"))
     app.add_handler(PreCheckoutQueryHandler(precheckout))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))

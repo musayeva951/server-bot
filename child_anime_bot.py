@@ -58,6 +58,11 @@ from pathlib import Path
 TOKEN = os.environ.get("CHILD_BOT_TOKEN", "")
 DB_PATH = Path(os.environ.get("CHILD_DB_PATH", "child.db"))
 OWNER_ID = int(os.environ.get("OWNER_ID", "0") or 0)
+# Server bot yaratish so'rovnomasidan keladi: qaysi funksiyalar yoqilgan,
+# panel qanaqa uslubda (colorful/simple/minimal). Env bo'lmasa — hammasi
+# yoqilgan, oddiy ko'rinish (eski botlar o'zgarmaydi).
+FEATURES = {x.strip() for x in os.environ.get("CHILD_FEATURES", "shorts,premium,sub,post,storage").split(",") if x.strip()}
+PANEL_STYLE = os.environ.get("PANEL_STYLE", "simple") or "simple"
 
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 log = logging.getLogger("child_anime_bot")
@@ -383,54 +388,102 @@ def anime_card(anime) -> str:
 # ---------------------------------------------------------------- bot
 
 def build_app():
-    from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
     from telegram.ext import (
         ApplicationBuilder, CallbackQueryHandler, CommandHandler,
         MessageHandler, filters,
     )
 
-    BTN_LIST = "📋 Anime ro'yxati"
-    BTN_NEW = "🆕 Yangilar"
-    BTN_TOP = "🔥 Mashhur"
-    BTN_SHORTS = "🎞 Shortlar"
-    BTN_ADD_ANIME = "➕ Anime qo'shish"
-    BTN_ADD_EP = "🎞 Qism qo'shish"
-    BTN_ADD_SHORT = "📱 Short qo'shish"
-    BTN_ADMIN = "🛡 Admin panel"
-    BTN_BACK_MAIN = "⬅️ Asosiy menyu"
+    if PANEL_STYLE == "minimal":
+        BTN_LIST, BTN_NEW, BTN_TOP, BTN_SHORTS = "Anime ro'yxati", "Yangilar", "Mashhur", "Shortlar"
+        BTN_ADD_ANIME, BTN_ADD_EP, BTN_ADD_SHORT = "Anime qo'shish", "Qism qo'shish", "Short qo'shish"
+        BTN_ADMIN, BTN_BACK_MAIN = "Admin panel", "Asosiy menyu"
+    else:
+        BTN_LIST = "📋 Anime ro'yxati"
+        BTN_NEW = "🆕 Yangilar"
+        BTN_TOP = "🔥 Mashhur"
+        BTN_SHORTS = "🎞 Shortlar"
+        BTN_ADD_ANIME = "➕ Anime qo'shish"
+        BTN_ADD_EP = "🎞 Qism qo'shish"
+        BTN_ADD_SHORT = "📱 Short qo'shish"
+        BTN_ADMIN = "🛡 Admin panel"
+        BTN_BACK_MAIN = "⬅️ Asosiy menyu"
 
     def is_owner(update) -> bool:
         return update.effective_user and update.effective_user.id == OWNER_ID
 
+    def _reply_style(text):
+        # Haqiqiy rangli tugma (Bot API 9.4, PTB 22.7+): primary=ko'k,
+        # success=yashil, danger=qizil. Oddiy/minimal uslubda rang berilmaydi.
+        if PANEL_STYLE != "colorful":
+            return None
+        if text == BTN_SHORTS:
+            return "danger"
+        if text == BTN_NEW:
+            return "success"
+        return "primary"
+
+    def _wrap_reply(rows):
+        if PANEL_STYLE != "colorful":
+            return rows
+        out = []
+        for row in rows:
+            out.append([KeyboardButton(cell, style=_reply_style(cell)) if _reply_style(cell) else cell for cell in row])
+        return out
+
+    def _ibtn(text, cb):
+        if PANEL_STYLE != "colorful":
+            return InlineKeyboardButton(text, callback_data=cb)
+        if cb == "admin:delete":
+            style = "danger"
+        elif cb == "admin:premium":
+            style = "success"
+        else:
+            style = "primary"
+        return InlineKeyboardButton(text, callback_data=cb, style=style)
+
     def menu_for(update):
         if is_owner(update):
-            return ReplyKeyboardMarkup(
-                [[BTN_LIST, BTN_NEW], [BTN_TOP, BTN_SHORTS],
-                 [BTN_ADD_ANIME, BTN_ADD_EP], [BTN_ADD_SHORT, BTN_ADMIN]],
-                resize_keyboard=True,
-            )
-        return ReplyKeyboardMarkup(
-            [[BTN_LIST, BTN_NEW], [BTN_TOP, BTN_SHORTS]], resize_keyboard=True
-        )
+            rows = [[BTN_LIST, BTN_NEW], [BTN_TOP, BTN_SHORTS] if "shorts" in FEATURES else [BTN_TOP],
+                    [BTN_ADD_ANIME, BTN_ADD_EP]]
+            if "shorts" in FEATURES:
+                rows.append([BTN_ADD_SHORT, BTN_ADMIN])
+            else:
+                rows.append([BTN_ADMIN])
+            return ReplyKeyboardMarkup(_wrap_reply(rows), resize_keyboard=True)
+        rows = [[BTN_LIST, BTN_NEW], [BTN_TOP, BTN_SHORTS] if "shorts" in FEATURES else [BTN_TOP]]
+        return ReplyKeyboardMarkup(_wrap_reply(rows), resize_keyboard=True)
 
     def admin_keyboard():
-        return InlineKeyboardMarkup([
-            [InlineKeyboardButton("📊 Statistika", callback_data="admin:stats"),
-             InlineKeyboardButton("👥 Foydalanuvchilar", callback_data="admin:users")],
-            [InlineKeyboardButton("✏️ Tahrirlash", callback_data="admin:edit"),
-             InlineKeyboardButton("🗑 O'chirish", callback_data="admin:delete")],
-            [InlineKeyboardButton("📢 E'lon yuborish", callback_data="admin:broadcast"),
-             InlineKeyboardButton("📤 Post joylash", callback_data="admin:post")],
-            [InlineKeyboardButton("📺 Obuna kanallari", callback_data="admin:channels"),
-             InlineKeyboardButton("📦 Saqlash kanali", callback_data="admin:storage")],
-            [InlineKeyboardButton("⭐ Premium berish/olish", callback_data="admin:premium"),
-             InlineKeyboardButton("💾 Baza nusxasi", callback_data="admin:backup")],
-        ])
+        rows = [
+            [_ibtn("📊 Statistika", "admin:stats"),
+             _ibtn("👥 Foydalanuvchilar", "admin:users")],
+            [_ibtn("✏️ Tahrirlash", "admin:edit"),
+             _ibtn("🗑 O'chirish", "admin:delete")],
+            [_ibtn("📢 E'lon yuborish", "admin:broadcast")],
+        ]
+        if "post" in FEATURES:
+            rows[-1].append(_ibtn("📤 Post joylash", "admin:post"))
+        chan_row = []
+        if "sub" in FEATURES:
+            chan_row.append(_ibtn("📺 Obuna kanallari", "admin:channels"))
+        if "storage" in FEATURES:
+            chan_row.append(_ibtn("📦 Saqlash kanali", "admin:storage"))
+        if chan_row:
+            rows.append(chan_row)
+        prem_row = []
+        if "premium" in FEATURES:
+            prem_row.append(_ibtn("⭐ Premium berish/olish", "admin:premium"))
+        prem_row.append(_ibtn("💾 Baza nusxasi", "admin:backup"))
+        rows.append(prem_row)
+        return InlineKeyboardMarkup(rows)
 
     def back_kb():
         return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Orqaga", callback_data="back:list")]])
 
     async def check_subscription(update, context) -> bool:
+        if "sub" not in FEATURES:
+            return True
         """Majburiy obuna: kanallar bo'lmasa True. Xatolikda botni buzmaslik
         uchun o'sha kanal o'tkazib yuboriladi (admin xato yozgan bo'lishi mumkin)."""
         if is_owner(update):
@@ -465,6 +518,8 @@ def build_app():
         return False
 
     def premium_blocked(update, anime) -> bool:
+        if "premium" not in FEATURES:
+            return False
         if not anime["is_premium"]:
             return False
         if is_owner(update):
@@ -493,6 +548,8 @@ def build_app():
         return True
 
     async def storage_copy(context, update, message_id: int) -> int:
+        if "storage" not in FEATURES:
+            return 0
         storage = get_setting("storage_channel", "")
         if not storage:
             return 0
@@ -571,8 +628,8 @@ def build_app():
             )
             return
         await update.message.reply_text(
-            "Assalomu alaykum! 👋\n\n🎬 Anime tanlang, nomini yozib qidiring yoki kodini yuboring.\n"
-            "Yangi animelar «🆕 Yangilar» da, eng ko'p ko'rilganlar «🔥 Mashhur» da.",
+            ("🌸 Assalomu alaykum! 🌸\n\n✨🎬 Anime tanlang, nomini yozib qidiring yoki kodini yuboring.\n" if PANEL_STYLE == "colorful" else "Assalomu alaykum! 👋\n\n🎬 Anime tanlang, nomini yozib qidiring yoki kodini yuboring.\n")
+            + "Yangi animelar «🆕 Yangilar» da, eng ko'p ko'rilganlar «🔥 Mashhur» da.",
             reply_markup=menu_for(update),
         )
         await send_anime_list(update, context)
@@ -1003,6 +1060,9 @@ def build_app():
                 return
             return await send_anime_list(update, context, order="top", title="🔥 Eng ko'p ko'rilgan animelar:")
         if text == BTN_SHORTS:
+            if "shorts" not in FEATURES:
+                await update.message.reply_text("Bu funksiya bu botda o'chirilgan.")
+                return
             context.user_data.pop("await", None)
             if not await check_subscription(update, context):
                 return
