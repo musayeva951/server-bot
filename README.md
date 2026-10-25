@@ -104,7 +104,8 @@ admin panel (super admin uchun, premium berish/olish) alohida turadi.
 
 - Tekin server kuchsiz: **256 MB xotira, kuniga 1 GB trafik**. Shuning
   uchun umumiy limit bor: `MAX_BOTS` (default 5), har foydalanuvchiga
-  hozircha 1 ta bot (`MAX_BOTS_PER_USER`).
+  hozircha 3 tagacha bot (`MAX_BOTS_PER_USER`). Super admin uchun
+  kishi limiti yo'q — faqat jami 5 ta limit turadi.
 - Kod fayli limiti: **2 MB**; zip ochilganda 10 MB.
 - Har bir bola-jarayonga yumshoq xotira limiti (512 MB) qo'yilgan, lekin
   bu to'liq izolyatsiya emas.

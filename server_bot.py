@@ -70,7 +70,7 @@ SUPER_ADMIN_ID = int(os.environ.get("SUPER_ADMIN_ID", "0") or 0)
 PRICE_SOM = int(os.environ.get("PRICE_SOM", "69000") or 69000)
 PRICE_STARS = int(os.environ.get("PRICE_STARS", "200") or 200)
 MAX_BOTS = int(os.environ.get("MAX_BOTS", "5") or 5)
-MAX_BOTS_PER_USER = int(os.environ.get("MAX_BOTS_PER_USER", "1") or 1)
+MAX_BOTS_PER_USER = int(os.environ.get("MAX_BOTS_PER_USER", "3") or 3)
 MAX_CODE_SIZE = int(os.environ.get("MAX_CODE_SIZE", str(2 * 1024 * 1024)) or 2 * 1024 * 1024)
 MAX_ZIP_EXTRACTED = 10 * 1024 * 1024  # zip ochilgandagi umumiy limit
 
@@ -1208,7 +1208,8 @@ def build_app():
 
     async def ask_token(update, context):
         """Bot yasash: avval turini tanlash (anime / kino)."""
-        if count_bots_user(update.effective_user.id) >= MAX_BOTS_PER_USER:
+        # Super admin uchun kishi limiti yo'q (jami 5 ta limit baribir turadi).
+        if not is_super_admin(update.effective_user.id) and count_bots_user(update.effective_user.id) >= MAX_BOTS_PER_USER:
             await update.message.reply_text(f"Limit: hozircha har foydalanuvchiga {MAX_BOTS_PER_USER} ta bot. Avval eskisini o'chiring.")
             return
         if count_bots_total() >= MAX_BOTS:
@@ -1457,7 +1458,8 @@ def build_app():
     # ---------- 2-usul: kod ----------
 
     async def ask_code(update, context):
-        if count_bots_user(update.effective_user.id) >= MAX_BOTS_PER_USER:
+        # Super admin uchun kishi limiti yo'q (jami 5 ta limit baribir turadi).
+        if not is_super_admin(update.effective_user.id) and count_bots_user(update.effective_user.id) >= MAX_BOTS_PER_USER:
             await update.message.reply_text(f"Limit: hozircha har foydalanuvchiga {MAX_BOTS_PER_USER} ta bot. Avval eskisini o'chiring.")
             return
         if count_bots_total() >= MAX_BOTS:
