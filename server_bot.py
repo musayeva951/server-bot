@@ -1164,9 +1164,11 @@ def build_app():
             [InlineKeyboardButton("📄 Log", callback_data=f"act:log:{bot_id}"),
              InlineKeyboardButton("🗑 O'chirish", callback_data=f"act:delask:{bot_id}")],
         ]
-        # Kod botiga token hali kiritilmagan bo'lsa — alohida tugma ko'rsatamiz.
-        if kind == "code" and not has_token:
-            rows.append([InlineKeyboardButton("🔑 Token kiritish", callback_data=f"act:codetoken:{bot_id}")])
+        # Kod botiga token tugmasi har doim ko'rinadi: token yo'q bo'lsa kiritish,
+        # bor bo'lsa almashtirish (masalan, token oshkor bo'lganda yangilash uchun).
+        if kind == "code":
+            label = "🔑 Token kiritish" if not has_token else "🔑 Token almashtirish"
+            rows.append([InlineKeyboardButton(label, callback_data=f"act:codetoken:{bot_id}")])
         # Kod boti: yangi kodni baza o'chmasdan almashtirish.
         if kind == "code":
             rows.append([InlineKeyboardButton("🔄 Kod yangilash", callback_data=f"act:codeupdate:{bot_id}")])
@@ -1222,10 +1224,12 @@ def build_app():
                 return
             context.user_data["await"] = "code_token"
             context.user_data["code_bot_id"] = bot_id
+            replacing = bool(row["token_enc"])
             await q.message.reply_text(
                 f"Bot #{bot_id} uchun tokenni yuboring.\n"
                 "Token getMe bilan tekshirilib, shifrlab saqlanadi va ishga tushirishda "
                 "BOT_TOKEN env orqali kodga beriladi. Token chatdan o'chirishga harakat qilinadi."
+                + (" Yangi token eski token o'rniga qo'yiladi, bot to'xtab yangi token bilan qayta ishga tushadi." if replacing else "")
             )
             return
         if action == "start":
@@ -1734,7 +1738,7 @@ def build_app():
         except Exception:
             pass
         if not bot_id:
-            await update.effective_chat.send_message("Avval kod botini tanlang — «🤖 Mening botlarim» dan «🔑 Token kiritish» ni bosing.")
+            await update.effective_chat.send_message("Avval kod botini tanlang — «🤖 Mening botlarim» dan «🔑 Token kiritish / almashtirish» ni bosing.")
             return
         row = get_bot(bot_id)
         if row is None or row["owner_id"] != update.effective_user.id or row["kind"] != "code":
@@ -1767,6 +1771,9 @@ def build_app():
         except TelegramError as e:
             await update.effective_chat.send_message(f"Telegram xatosi: {e}. Token saqlanmadi.")
             return
+        was_running = is_running(bot_id)
+        if was_running:
+            stop_bot(bot_id)
         update_bot(bot_id, token_enc=encrypt_token(token), token_hash=fp,
                    bot_username=me.username or "")
         context.user_data.pop("await", None)
