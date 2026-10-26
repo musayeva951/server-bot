@@ -48,7 +48,7 @@ import threading
 import urllib.parse
 import urllib.request
 import zipfile
-from datetime import datetime
+from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -69,6 +69,20 @@ SUPER_ADMIN_ID = int(os.environ.get("SUPER_ADMIN_ID", "0") or 0)
 # (ya'ni bot egasiga — super adminga).
 PRICE_SOM = int(os.environ.get("PRICE_SOM", "69000") or 69000)
 PRICE_STARS = int(os.environ.get("PRICE_STARS", "200") or 200)
+# Oylik server to'lovi (2026-10-26 Umid qarori): har bir bot uchun har oy.
+# Yaratish narxidan alohida, lekin yangi botning birinchi oyi yaratish
+# narxiga kiradi (paid_until = yaratilgan kun + 30 kun).
+# Stars avtomatik (invoice), so'm/karta qo'lda tasdiqlash bilan
+# (Telegram'da Uzcard/Humo uchun avtomatik provayder yo'q, merchant
+# API bo'lmasa shaxsiy karta o'tkazmasi avtomatik tekshirilmaydi).
+MONTHLY_SOM = int(os.environ.get("MONTHLY_SOM", "15000") or 15000)
+MONTHLY_STARS = int(os.environ.get("MONTHLY_STARS", "50") or 50)
+MONTHLY_DAYS = 30
+# Ichki hamyon kursi: 1 ⭐ = 300 so'm (50 ⭐ = 15 000 so'm oylik narxiga mos).
+# Balans faqat so'mda yuritiladi: Stars bilan to'ldirsa shu kursda so'mga
+# aylanadi, karta bilan to'ldirsa to'g'ridan-to'g'ri so'm tushadi.
+# Real pul to'ldirish vaqtida super adminga tushadi, balans — faqat hisob.
+WALLET_STAR_RATE = 300
 MAX_BOTS = int(os.environ.get("MAX_BOTS", "5") or 5)
 MAX_BOTS_PER_USER = int(os.environ.get("MAX_BOTS_PER_USER", "3") or 3)
 MAX_CODE_SIZE = int(os.environ.get("MAX_CODE_SIZE", str(2 * 1024 * 1024)) or 2 * 1024 * 1024)
@@ -212,6 +226,43 @@ def init_db():
             c.execute("ALTER TABLE bots ADD COLUMN bot_features TEXT DEFAULT 'shorts,premium,sub,post,storage'")
         if "panel_style" not in cols:
             c.execute("ALTER TABLE bots ADD COLUMN panel_style TEXT DEFAULT 'simple'")
+        if "paid_until" not in cols:
+            c.execute("ALTER TABLE bots ADD COLUMN paid_until TEXT DEFAULT ''")
+            # Eski botlarga jonli yangilanishdan boshlab 30 kun imtiyoz:
+            # birdaniga to'xtab qolmasin, egasi oylik haqida xabar olsin.
+            # Super admin botlari bundan mustasno (ular uchun to'lov yo'q).
+            c.execute(
+                "UPDATE bots SET paid_until = datetime('now', '+30 days') "
+                "WHERE (paid_until IS NULL OR paid_until = '') AND owner_id != ?",
+                (SUPER_ADMIN_ID,),
+            )
+        # Server sozlamalari: karta to'lov ma'lumoti (faqat super admin
+        # bot ichida o'rnatadi, kodda karta raqami yozilmaydi).
+        c.execute(
+            """CREATE TABLE IF NOT EXISTS server_config(
+                   key TEXT PRIMARY KEY,
+                   value TEXT DEFAULT '')"""
+        )
+        # Karta to'lov so'rovlari: foydalanuvchi chek yuboradi, super
+        # admin tasdiqlasa oylik uzayadi, rad etsa uzaymaydi.
+        c.execute(
+            """CREATE TABLE IF NOT EXISTS card_payments(
+                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   user_id INTEGER NOT NULL,
+                   bot_id INTEGER NOT NULL,
+                   amount_som INTEGER NOT NULL,
+                   status TEXT NOT NULL DEFAULT 'pending',
+                   created_at TEXT NOT NULL,
+                   decided_at TEXT DEFAULT '')"""
+        )
+        # Ichki hamyon: bot_id=0 bo'lgan karta so'rovi hamyon to'ldirish
+        # degani (oylik emas). Balans so'mda, Stars 300 so'm/⭐ kursda tushadi.
+        c.execute(
+            """CREATE TABLE IF NOT EXISTS wallet_users(
+                   user_id INTEGER PRIMARY KEY,
+                   balance_som INTEGER NOT NULL DEFAULT 0,
+                   updated_at TEXT DEFAULT '')"""
+        )
         # Premium: har bir kredit = 1 ta bot yasash + serverga ulash huquqi.
         # To'lov (Stars) yoki super admin berganda kredit qo'shiladi,
         # bot muvaffaqiyatli yaratilganda 1 kredit ishlatiladi.
@@ -275,13 +326,16 @@ def smallest_free_bot_id() -> int:
 
 def create_bot(owner_id, kind, token_enc="", token_hash="", code_dir="", entry_file="", bot_username="", bot_type="anime", bot_features="shorts,premium,sub,post,storage", panel_style="simple"):
     bot_id = smallest_free_bot_id()
+    now = datetime.now()
+    # Yangi botning birinchi oyi yaratish narxiga kiradi.
+    paid_until = "" if is_super_admin(owner_id) else (now + timedelta(days=MONTHLY_DAYS)).isoformat(timespec="seconds")
     with db_conn() as c:
         c.execute(
             """INSERT INTO bots(id, owner_id, kind, token_enc, token_hash, code_dir,
-                                entry_file, bot_username, status, created_at, bot_type, bot_features, panel_style)
-               VALUES(?,?,?,?,?,?,?,?,'stopped',?,?,?,?)""",
+                                entry_file, bot_username, status, created_at, bot_type, bot_features, panel_style, paid_until)
+               VALUES(?,?,?,?,?,?,?,?,'stopped',?,?,?,?,?)""",
             (bot_id, owner_id, kind, token_enc, token_hash, code_dir, entry_file,
-             bot_username, datetime.now().isoformat(timespec="seconds"), bot_type, bot_features, panel_style),
+             bot_username, now.isoformat(timespec="seconds"), bot_type, bot_features, panel_style, paid_until),
         )
         return bot_id
 
@@ -312,6 +366,131 @@ def get_all_bots():
 def delete_bot_row(bot_id: int):
     with db_conn() as c:
         c.execute("DELETE FROM bots WHERE id=?", (bot_id,))
+
+
+# ---------------------------------------------------------------- oylik to'lov
+
+def get_config(key: str) -> str:
+    with db_conn() as c:
+        row = c.execute("SELECT value FROM server_config WHERE key=?", (key,)).fetchone()
+        return row["value"] if row else ""
+
+
+def set_config(key: str, value: str) -> None:
+    with db_conn() as c:
+        c.execute(
+            "INSERT INTO server_config(key, value) VALUES(?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )
+
+
+def _parse_paid_until(row) -> object | None:
+    try:
+        raw = row["paid_until"] if "paid_until" in row.keys() else ""
+    except Exception:
+        raw = ""
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(str(raw))
+    except Exception:
+        return None
+
+
+def monthly_status(row) -> tuple[bool, str]:
+    """(to'langanmi, ko'rsatish matni). Super admin botlari har doim to'langan."""
+    if is_super_admin(row["owner_id"]):
+        return True, "super admin — oylik yo'q"
+    until = _parse_paid_until(row)
+    if until is None:
+        return True, "imtiyoz davri (30 kun)"
+    if until >= datetime.now():
+        return True, until.strftime("%Y-%m-%d") + " gacha"
+    return False, until.strftime("%Y-%m-%d") + " da tugagan"
+
+
+def extend_monthly(bot_id: int) -> str:
+    """Oylikni 30 kunga uzaytiradi: muddat tugamagan bo'lsa ustiga qo'shiladi."""
+    row = get_bot(bot_id)
+    if row is None:
+        return ""
+    until = _parse_paid_until(row)
+    base = until if until and until > datetime.now() else datetime.now()
+    new_until = base + timedelta(days=MONTHLY_DAYS)
+    new_str = new_until.isoformat(timespec="seconds")
+    update_bot(bot_id, paid_until=new_str)
+    return new_str
+
+
+def create_card_payment(user_id: int, bot_id: int, amount_som: int = 0) -> int:
+    if not amount_som:
+        amount_som = MONTHLY_SOM
+    with db_conn() as c:
+        cur = c.execute(
+            "INSERT INTO card_payments(user_id, bot_id, amount_som, created_at) "
+            "VALUES(?,?,?,?)",
+            (user_id, bot_id, amount_som, datetime.now().isoformat(timespec="seconds")),
+        )
+        return int(cur.lastrowid)
+
+
+def get_card_payment(req_id: int):
+    with db_conn() as c:
+        return c.execute("SELECT * FROM card_payments WHERE id=?", (req_id,)).fetchone()
+
+
+def decide_card_payment(req_id: int, status: str) -> None:
+    with db_conn() as c:
+        c.execute(
+            "UPDATE card_payments SET status=?, decided_at=? WHERE id=?",
+            (status, datetime.now().isoformat(timespec="seconds"), req_id),
+        )
+
+
+def list_pending_card_payments():
+    with db_conn() as c:
+        return c.execute(
+            "SELECT * FROM card_payments WHERE status='pending' ORDER BY id"
+        ).fetchall()
+
+
+def get_all_users():
+    with db_conn() as c:
+        return c.execute("SELECT * FROM users ORDER BY user_id").fetchall()
+
+
+def get_balance(user_id: int) -> int:
+    with db_conn() as c:
+        row = c.execute("SELECT balance_som FROM wallet_users WHERE user_id=?", (user_id,)).fetchone()
+        return int(row["balance_som"]) if row else 0
+
+
+def add_balance(user_id: int, amount_som: int) -> int:
+    now = datetime.now().isoformat(timespec="seconds")
+    with db_conn() as c:
+        c.execute(
+            "INSERT INTO wallet_users(user_id, balance_som, updated_at) VALUES(?,?,?) "
+            "ON CONFLICT(user_id) DO UPDATE SET "
+            "balance_som = wallet_users.balance_som + excluded.balance_som, "
+            "updated_at = excluded.updated_at",
+            (user_id, amount_som, now),
+        )
+        row = c.execute("SELECT balance_som FROM wallet_users WHERE user_id=?", (user_id,)).fetchone()
+        return int(row["balance_som"])
+
+
+def deduct_balance(user_id: int, amount_som: int) -> bool:
+    """Balans yetarli bo'lsa yechadi, yetmasa hech narsa o'zgarmaydi."""
+    with db_conn() as c:
+        row = c.execute("SELECT balance_som FROM wallet_users WHERE user_id=?", (user_id,)).fetchone()
+        if not row or int(row["balance_som"]) < amount_som:
+            return False
+        c.execute(
+            "UPDATE wallet_users SET balance_som = balance_som - ?, updated_at = ? WHERE user_id=?",
+            (amount_som, datetime.now().isoformat(timespec="seconds"), user_id),
+        )
+        return True
 
 
 # ---------------------------------------------------------------- premium / to'lov
@@ -443,6 +622,13 @@ def start_bot(bot_id: int) -> tuple[bool, str]:
     row = get_bot(bot_id)
     if row is None:
         return False, "Bot topilmadi"
+    paid, _label = monthly_status(row)
+    if not paid:
+        return False, (
+            f"Oylik to'lov muddati tugagan. «🤖 Mening botlarim» → Bot #{bot_id} → "
+            f"«💳 Oylik to'lash» dan {MONTHLY_SOM:,} so'm / {MONTHLY_STARS} ⭐ to'lang, "
+            "keyin qayta ishga tushiring."
+        )
     if is_running(bot_id):
         return True, "Allaqachon ishlayapti"
     work = bot_work_dir(bot_id)
@@ -1120,6 +1306,7 @@ def build_app():
     BTN_MY = "🤖 Mening botlarim"
     BTN_HELP = "ℹ️ Yordam"
     BTN_PREMIUM = "💎 Premium olish"
+    BTN_WALLET = "💰 Hamyonim"
     BTN_ADMIN = "🛡 Admin panel"
 
     # Rangli panel (Bot API style, PTB 22.7+): primary=ko'k, success=yashil, danger=qizil.
@@ -1147,7 +1334,7 @@ def build_app():
         return InlineKeyboardButton(text, callback_data=callback_data, style=style)
 
     def main_menu(user_id: int = 0):
-        rows = [[BTN_TOKEN, BTN_CODE], [BTN_MY, BTN_PREMIUM], [BTN_HELP]]
+        rows = [[BTN_TOKEN, BTN_CODE], [BTN_MY, BTN_PREMIUM], [BTN_WALLET, BTN_HELP]]
         if user_id and is_super_admin(user_id):
             rows.append([BTN_ADMIN])
         return ReplyKeyboardMarkup(_colored(rows), resize_keyboard=True)
@@ -1171,6 +1358,12 @@ def build_app():
         "bot.py/main.py bor .zip) tashlang, keyin shu kod uchun bot tokenini yuboring. Token getMe bilan "
         "tekshirilib, shifrlab saqlanadi va ishga tushirishda BOT_TOKEN env orqali kodga beriladi. "
         "Kod o'z papkasida alohida jarayon bo'lib ishlaydi.\n\n"
+        f"*💰 Hamyon:* «💰 Hamyonim» dan balans to'ldiring (Stars — 1 ⭐ = 300 so'm, karta — chek tasdiqlangach). "
+        "Oylik muddati tugaganda, balansda pul bo'lsa, oylik avtomatik yechilib uzayadi.\n\n"
+        f"*Oylik server to'lovi:* har bir bot uchun har oy {MONTHLY_SOM:,} so'm / {MONTHLY_STARS} ⭐ (30 kun). "
+        "Yangi botning birinchi oyi yaratish narxiga kiradi. Muddat tugasa bot ishga tushmaydi — "
+        "«🤖 Mening botlarim» → «💳 Oylik to'lash» dan to'lang: Stars avtomatik uzaytiradi, "
+        "karta to'lovida chek yuborasiz, super admin tasdiqlasa uzayadi.\n\n"
         f"Cheklovlar: hozircha har foydalanuvchiga {MAX_BOTS_PER_USER} ta bot, jami {MAX_BOTS} ta bot "
         "(tekin server kuchsiz: 256 MB xotira, kuniga 1 GB trafik — shuning uchun limit bor). "
         "Fayl limiti: 2 MB.\n\n"
@@ -1206,6 +1399,7 @@ def build_app():
              _ibtn("⏹ To'xtatish", callback_data=f"act:stop:{bot_id}")],
             [_ibtn("📄 Log", callback_data=f"act:log:{bot_id}"),
              _ibtn("🗑 O'chirish", callback_data=f"act:delask:{bot_id}")],
+            [_ibtn("💳 Oylik to'lash", callback_data=f"monthly:show:{bot_id}")],
         ]
         # Kod botiga token tugmasi har doim ko'rinadi: token yo'q bo'lsa kiritish,
         # bor bo'lsa almashtirish (masalan, token oshkor bo'lganda yangilash uchun).
@@ -1236,8 +1430,10 @@ def build_app():
                 btype = f"\nTuri: {TEMPLATE_NAMES.get(bt, bt)}"
                 if "panel_style" in row.keys() and row["panel_style"]:
                     btype += f"\nPanel: {PANEL_STYLES.get(row['panel_style'], row['panel_style'])}"
+            _paid, _until_label = monthly_status(row)
+            _monthly_line = "" if is_super_admin(user_id) else f"\n💳 Oylik: {_until_label}"
             await update.message.reply_text(
-                f"🤖 Bot #{row['id']} — {name}\nUsul: {kind}{btype}\nHolat: {status}\nYaratilgan: {row['created_at']}",
+                f"🤖 Bot #{row['id']} — {name}\nUsul: {kind}{btype}\nHolat: {status}\nYaratilgan: {row['created_at']}{_monthly_line}",
                 reply_markup=bot_buttons(row["id"], kind=row["kind"], has_token=bool(row["token_enc"])),
             )
 
@@ -1315,6 +1511,414 @@ def build_app():
             await q.edit_message_text(f"Bot #{bot_id} o'chirildi 🗑")
         elif action == "delno":
             await q.edit_message_text(f"Bot #{bot_id} qoldirildi.")
+
+    # ---------- oylik to'lov (Stars avtomatik + karta qo'lda) ----------
+
+    async def show_monthly(update, context):
+        q = update.callback_query
+        await q.answer()
+        parts = q.data.split(":")
+        bot_id = int(parts[2]) if len(parts) > 2 else 0
+        row = get_bot(bot_id)
+        if row is None or row["owner_id"] != q.from_user.id:
+            await q.edit_message_text("Bot topilmadi yoki sizniki emas.")
+            return
+        _paid, _label = monthly_status(row)
+        kb = InlineKeyboardMarkup([
+            [_ibtn(f"⭐ {MONTHLY_STARS} Stars bilan to'lash", callback_data=f"monthly:stars:{bot_id}")],
+            [_ibtn("💳 Karta orqali to'lash (so'm)", callback_data=f"monthly:card:{bot_id}")],
+            [_ibtn(f"💰 Hamyondan to'lash ({get_balance(q.from_user.id):,} so'm)", callback_data=f"monthly:wallet:{bot_id}")],
+        ])
+        await q.edit_message_text(
+            f"💳 Bot #{bot_id} uchun oylik server to'lovi\n"
+            f"Narxi: {MONTHLY_SOM:,} so'm / {MONTHLY_STARS} ⭐ (30 kun)\n"
+            f"Hozirgi holat: {_label}\n\n"
+            "⭐ Stars — avtomatik: to'lagan zahoti oylik uzayadi.\n"
+            "💳 Karta — qo'lda: to'lab chek yuborasiz, super admin tasdiqlasa oylik uzayadi.\n"
+            "💰 Hamyon — balans yetarli bo'lsa, shu zahoti yechiladi; muddat tugaganda "
+            "ham balansdan avtomatik yechiladi.",
+            reply_markup=kb,
+        )
+
+    async def monthly_stars(update, context):
+        from telegram import LabeledPrice
+
+        q = update.callback_query
+        await q.answer()
+        bot_id = int(q.data.split(":")[2])
+        row = get_bot(bot_id)
+        if row is None or row["owner_id"] != q.from_user.id:
+            await q.edit_message_text("Bot topilmadi yoki sizniki emas.")
+            return
+        if is_super_admin(q.from_user.id):
+            await q.edit_message_text("Siz super admins — oylik to'lov kerak emas.")
+            return
+        try:
+            await context.bot.send_invoice(
+                chat_id=q.message.chat_id,
+                title=f"Oylik server to'lovi — Bot #{bot_id}",
+                description=f"Bot #{bot_id} ni serverda yana 30 kun ushlab turish. Narxi: {MONTHLY_SOM:,} so'm / {MONTHLY_STARS} ⭐.",
+                payload=f"monthly:{bot_id}",
+                provider_token="",
+                currency="XTR",
+                prices=[LabeledPrice(f"Oylik — Bot #{bot_id}", MONTHLY_STARS)],
+            )
+        except Exception as e:
+            await q.message.reply_text(f"To'lov invoysini yuborib bo'lmadi: {e}")
+
+    async def monthly_card(update, context):
+        q = update.callback_query
+        await q.answer()
+        bot_id = int(q.data.split(":")[2])
+        row = get_bot(bot_id)
+        if row is None or row["owner_id"] != q.from_user.id:
+            await q.edit_message_text("Bot topilmadi yoki sizniki emas.")
+            return
+        card_info = get_config("card_info")
+        if not card_info:
+            await q.edit_message_text(
+                "💳 Karta to'lovi hozircha sozlanmagan.\n"
+                "Super admin hali karta ma'lumotini kiritmagan — "
+                "«⭐ Stars» bilan to'lang yoki super adminga yozing."
+            )
+            return
+        kb = InlineKeyboardMarkup([[
+            _ibtn("✅ To'ladim, chek yuboraman", callback_data=f"monthly:carddone:{bot_id}"),
+        ]])
+        await q.edit_message_text(
+            f"💳 Bot #{bot_id} uchun oylik: {MONTHLY_SOM:,} so'm\n\n"
+            f"{card_info}\n\n"
+            "To'lovni shu rekvizitga o'tkazing, keyin «✅ To'ladim» ni bosib "
+            "chek rasmini yuboring. Super admin tasdiqlasa, oylik 30 kunga uzayadi.",
+            reply_markup=kb,
+        )
+
+    async def monthly_card_done(update, context):
+        q = update.callback_query
+        await q.answer()
+        bot_id = int(q.data.split(":")[2])
+        row = get_bot(bot_id)
+        if row is None or row["owner_id"] != q.from_user.id:
+            await q.edit_message_text("Bot topilmadi yoki sizniki emas.")
+            return
+        context.user_data["await"] = "card_check"
+        context.user_data["card_kind"] = "monthly"
+        context.user_data["card_bot_id"] = bot_id
+        await q.message.reply_text(
+            f"Bot #{bot_id} uchun {MONTHLY_SOM:,} so'm to'lov cheki rasmini yuboring "
+            "(foto yoki fayl). Chek super adminga boradi, tasdiqlasa oylik uzayadi."
+        )
+
+    async def monthly_router(update, context):
+        action = update.callback_query.data.split(":")[1]
+        if action == "show":
+            return await show_monthly(update, context)
+        if action == "stars":
+            return await monthly_stars(update, context)
+        if action == "card":
+            return await monthly_card(update, context)
+        if action == "carddone":
+            return await monthly_card_done(update, context)
+        if action == "wallet":
+            return await monthly_wallet_pay(update, context)
+
+    async def cardpay_decide(update, context):
+        """Super adminning karta to'lovini tasdiqlash / rad etishi."""
+        q = update.callback_query
+        await q.answer()
+        if not is_super_admin(q.from_user.id):
+            await q.edit_message_text("Faqat super admin tasdiqlay oladi.")
+            return
+        _prefix, action, raw_id = q.data.split(":", 2)
+        req_id = int(raw_id)
+        req = get_card_payment(req_id)
+        if req is None or req["status"] != "pending":
+            await q.edit_message_text("Bu to'lov so'rovi allaqachon ko'rib chiqilgan.")
+            return
+        if action == "approve":
+            decide_card_payment(req_id, "approved")
+            if int(req["bot_id"]) == 0:
+                new_balance = add_balance(req["user_id"], int(req["amount_som"]))
+                await q.edit_message_text(
+                    f"✅ Karta to'lovi tasdiqlandi: so'rov #{req_id}, "
+                    f"hamyonga {int(req['amount_som']):,} so'm tushdi. "
+                    f"Balans endi: {new_balance:,} so'm."
+                )
+                try:
+                    await context.bot.send_message(
+                        chat_id=req["user_id"],
+                        text=f"✅ Karta to'lovingiz tasdiqlandi! Hamyoningizga "
+                             f"{int(req['amount_som']):,} so'm tushdi. "
+                             f"Balans: {new_balance:,} so'm.",
+                    )
+                except Exception:
+                    pass
+                return
+            new_until = extend_monthly(req["bot_id"])
+            await q.edit_message_text(
+                f"✅ Karta to'lovi tasdiqlandi: so'rov #{req_id}, Bot #{req['bot_id']} "
+                f"oyligi {new_until[:10]} gacha uzaytirildi."
+            )
+            try:
+                await context.bot.send_message(
+                    chat_id=req["user_id"],
+                    text=f"✅ Karta to'lovingiz tasdiqlandi! Bot #{req['bot_id']} oyligi "
+                         f"{new_until[:10]} gacha uzaytirildi.",
+                )
+            except Exception:
+                pass
+        else:
+            decide_card_payment(req_id, "rejected")
+            await q.edit_message_text(f"❌ Karta to'lovi rad etildi: so'rov #{req_id}.")
+            try:
+                await context.bot.send_message(
+                    chat_id=req["user_id"],
+                    text="❌ Karta to'lovingiz rad etildi. "
+                         "Chekni tekshirib, qayta yuboring yoki Stars bilan to'lang.",
+                )
+            except Exception:
+                pass
+
+    async def handle_card_check_photo(update, context):
+        """Foydalanuvchi chek rasmini yuborganda: super adminga so'rov boradi."""
+        kind = context.user_data.get("card_kind", "monthly")
+        if kind == "wallet":
+            amount = int(context.user_data.get("card_amount") or 0)
+            if not amount:
+                await update.message.reply_text("Avval «💰 Hamyonim» → «💳 Karta» dan summani tanlang.")
+                return
+            context.user_data.pop("await", None)
+            context.user_data.pop("card_kind", None)
+            context.user_data.pop("card_amount", None)
+            # bot_id=0 — hamyon to'ldirish belgisi (oylik emas).
+            req_id = create_card_payment(update.effective_user.id, 0, amount)
+            await update.message.reply_text(
+                f"✅ Chek qabul qilindi (so'rov #{req_id}). Super admin tasdiqlasa, "
+                f"{amount:,} so'm hamyoningizga tushadi. Kuting."
+            )
+            bot_id = 0
+        else:
+            bot_id = context.user_data.get("card_bot_id")
+            if not bot_id:
+                await update.message.reply_text("Avval «💳 Oylik to'lash» → «💳 Karta» ni bosing.")
+                return
+            context.user_data.pop("await", None)
+            context.user_data.pop("card_kind", None)
+            context.user_data.pop("card_bot_id", None)
+            req_id = create_card_payment(update.effective_user.id, bot_id)
+            await update.message.reply_text(
+                f"✅ Chek qabul qilindi (so'rov #{req_id}). Super admin tasdiqlasa, "
+                f"Bot #{bot_id} oyligi 30 kunga uzayadi. Kuting."
+            )
+        if SUPER_ADMIN_ID:
+            kb = InlineKeyboardMarkup([[
+                _ibtn("✅ Tasdiqlash", callback_data=f"cardpay:approve:{req_id}"),
+                _ibtn("❌ Rad etish", callback_data=f"cardpay:reject:{req_id}"),
+            ]])
+            try:
+                # Avval chekni admin chatiga forward qilamiz, keyin so'rov xabari.
+                await context.bot.forward_message(
+                    chat_id=SUPER_ADMIN_ID,
+                    from_chat_id=update.message.chat_id,
+                    message_id=update.message.message_id,
+                )
+                _req = get_card_payment(req_id)
+                _purpose = "hamyon to'ldirish" if bot_id == 0 else f"Bot #{bot_id} oyligi"
+                _amount = int(_req["amount_som"]) if _req else MONTHLY_SOM
+                await context.bot.send_message(
+                    chat_id=SUPER_ADMIN_ID,
+                    text=f"💳 Yangi karta to'lov so'rovi #{req_id}\n"
+                         f"Foydalanuvchi: {update.effective_user.id} (@{update.effective_user.username or ''})\n"
+                         f"Maqsad: {_purpose}, summa: {_amount:,} so'm\n"
+                         "Yuqoridagi chekni tekshirib, tasdiqlang yoki rad eting.",
+                    reply_markup=kb,
+                )
+            except Exception:
+                pass
+
+    # ---------- ichki hamyon ----------
+
+    WALLET_TOPUP_STARS = [50, 150, 300]  # Stars: 1 oy, 3 oy, 6 oy ekvivalenti
+    WALLET_TOPUP_SOM = [15000, 45000, 90000]
+
+    async def show_wallet(update, context):
+        user_id = update.effective_user.id
+        balance = get_balance(user_id)
+        months = balance // MONTHLY_SOM
+        kb = InlineKeyboardMarkup([
+            [_ibtn("⭐ Stars bilan to'ldirish", callback_data="wallet:starsmenu")],
+            [_ibtn("💳 Karta bilan to'ldirish", callback_data="wallet:cardmenu")],
+        ])
+        text = (
+            f"💰 Hamyoningiz\n"
+            f"Balans: {balance:,} so'm\n"
+            f"Bu — taxminan {months} ta oylik to'lov ({MONTHLY_SOM:,} so'm / oy).\n\n"
+            "Stars bilan to'ldirsa, 1 ⭐ = 300 so'm kursda balansga tushadi "
+            "(50 ⭐ = 15 000 so'm, 1 oy). Karta bilan to'ldirsa, chekni super "
+            "admin tasdiqlagach balansga tushadi.\n"
+            "Oylik muddati tugaganda, balansda pul bo'lsa, oylik avtomatik "
+            "yechilib uzayadi — har oy qo'lda to'lash shart emas."
+        )
+        if update.callback_query:
+            await update.callback_query.answer()
+            await update.callback_query.edit_message_text(text, reply_markup=kb)
+        else:
+            await update.message.reply_text(text, reply_markup=kb)
+
+    async def wallet_stars_menu(update, context):
+        q = update.callback_query
+        await q.answer()
+        rows = [[_ibtn(f"⭐ {s} Stars = {s * WALLET_STAR_RATE:,} so'm", callback_data=f"wallet:stars:{s}")]
+                for s in WALLET_TOPUP_STARS]
+        await q.edit_message_text(
+            "⭐ Qancha to'ldirasiz? To'lov avtomatik, balans shu zahoti ochiladi.",
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+
+    async def wallet_card_menu(update, context):
+        q = update.callback_query
+        await q.answer()
+        card_info = get_config("card_info")
+        if not card_info:
+            await q.edit_message_text(
+                "💳 Karta to'lovi hozircha sozlanmagan.\n"
+                "Super admin hali karta ma'lumotini kiritmagan — "
+                "«⭐ Stars» bilan to'ldiring yoki super adminga yozing."
+            )
+            return
+        rows = [[_ibtn(f"💳 {s:,} so'm", callback_data=f"wallet:card:{s}")]
+                for s in WALLET_TOPUP_SOM]
+        await q.edit_message_text(
+            f"💳 Qancha to'ldirasiz?\n\n{card_info}\n\n"
+            "Summani tanlang, keyin to'lab chek rasmini yuboring — "
+            "super admin tasdiqlasa balansga tushadi.",
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+
+    async def wallet_stars_invoice(update, context):
+        from telegram import LabeledPrice
+
+        q = update.callback_query
+        await q.answer()
+        stars = int(q.data.split(":")[2])
+        if stars not in WALLET_TOPUP_STARS:
+            await q.edit_message_text("Noma'lum summa.")
+            return
+        try:
+            await context.bot.send_invoice(
+                chat_id=q.message.chat_id,
+                title="Hamyon to'ldirish",
+                description=f"Server bot hamyoniga {stars} ⭐ = {stars * WALLET_STAR_RATE:,} so'm.",
+                payload=f"wallet:{stars}",
+                provider_token="",
+                currency="XTR",
+                prices=[LabeledPrice("Hamyon to'ldirish", stars)],
+            )
+        except Exception as e:
+            await q.message.reply_text(f"To'lov invoysini yuborib bo'lmadi: {e}")
+
+    async def wallet_card_done(update, context):
+        q = update.callback_query
+        await q.answer()
+        amount = int(q.data.split(":")[2])
+        if amount not in WALLET_TOPUP_SOM:
+            await q.edit_message_text("Noma'lum summa.")
+            return
+        context.user_data["await"] = "card_check"
+        context.user_data["card_kind"] = "wallet"
+        context.user_data["card_amount"] = amount
+        context.user_data.pop("card_bot_id", None)
+        await q.message.reply_text(
+            f"Hamyon uchun {amount:,} so'm to'lov cheki rasmini yuboring "
+            "(foto yoki fayl). Super admin tasdiqlasa, balansga tushadi."
+        )
+
+    async def wallet_router(update, context):
+        action = update.callback_query.data.split(":")[1]
+        if action == "show":
+            return await show_wallet(update, context)
+        if action == "starsmenu":
+            return await wallet_stars_menu(update, context)
+        if action == "cardmenu":
+            return await wallet_card_menu(update, context)
+        if action == "stars":
+            return await wallet_stars_invoice(update, context)
+        if action == "card":
+            return await wallet_card_done(update, context)
+
+    async def monthly_wallet_pay(update, context):
+        """Oylikni hamyondan to'lash (bitta bot uchun, qo'lda)."""
+        q = update.callback_query
+        await q.answer()
+        bot_id = int(q.data.split(":")[2])
+        row = get_bot(bot_id)
+        if row is None or row["owner_id"] != q.from_user.id:
+            await q.edit_message_text("Bot topilmadi yoki sizniki emas.")
+            return
+        if is_super_admin(q.from_user.id):
+            await q.edit_message_text("Siz super admins — oylik to'lov kerak emas.")
+            return
+        if not deduct_balance(q.from_user.id, MONTHLY_SOM):
+            await q.edit_message_text(
+                f"💰 Hamyoningizda yetarli pul yo'q. Kerak: {MONTHLY_SOM:,} so'm, "
+                f"balans: {get_balance(q.from_user.id):,} so'm.\n"
+                "Avval «💰 Hamyonim» dan to'ldiring."
+            )
+            return
+        new_until = extend_monthly(bot_id)
+        await q.edit_message_text(
+            f"✅ Hamyondan to'landi: {MONTHLY_SOM:,} so'm\n"
+            f"💳 Bot #{bot_id} oyligi {new_until[:10]} gacha uzaytirildi.\n"
+            f"Qolgan balans: {get_balance(q.from_user.id):,} so'm."
+        )
+
+    async def check_monthly_wallets(bot):
+        """Avtomatik oylik yechish — bir marta tekshiruv (loop ham, test ham shu)."""
+        for row in get_all_bots():
+            if is_super_admin(row["owner_id"]):
+                continue
+            _paid, _label = monthly_status(row)
+            if _paid:
+                continue
+            owner_id = row["owner_id"]
+            if deduct_balance(owner_id, MONTHLY_SOM):
+                new_until = extend_monthly(row["id"])
+                try:
+                    await bot.send_message(
+                        chat_id=owner_id,
+                        text=f"💰 Bot #{row['id']} oyligi hamyoningizdan avtomatik uzaytirildi: "
+                             f"{MONTHLY_SOM:,} so'm, {new_until[:10]} gacha. "
+                             f"Qolgan balans: {get_balance(owner_id):,} so'm.",
+                    )
+                except Exception:
+                    pass
+            else:
+                # Balans yetmasa, ishlayotgan bot to'xtatiladi (bir marta:
+                # status stopped bo'lgach keyingi tekshiruvda xabar takrorlanmaydi).
+                was_running = row["status"] == "running" and is_running(row["id"])
+                if was_running:
+                    stop_bot(row["id"])
+                if was_running or row["status"] == "running":
+                    try:
+                        await bot.send_message(
+                            chat_id=owner_id,
+                            text=f"⚠️ Bot #{row['id']} oylik muddati tugadi va hamyoningizda "
+                                 f"yetarli pul yo'q (kerak: {MONTHLY_SOM:,} so'm, "
+                                 f"balans: {get_balance(owner_id):,} so'm). Bot to'xtatildi. "
+                                 "«💰 Hamyonim» dan to'ldirib, «🤖 Mening botlarim» dan qayta ishga tushiring.",
+                        )
+                    except Exception:
+                        pass
+
+    async def monthly_wallet_loop(app):
+        import asyncio as _asyncio
+
+        while True:
+            try:
+                await _asyncio.sleep(3600)
+                await check_monthly_wallets(app.bot)
+            except Exception as e:
+                log.warning("Oylik hamyon tekshiruvi xato: %s", e)
 
     # ---------- 1-usul: token ----------
 
@@ -1469,10 +2073,21 @@ def build_app():
 
     async def precheckout(update, context):
         q = update.pre_checkout_query
-        if q.invoice_payload != "premium-1bot":
+        payload = q.invoice_payload or ""
+        if payload == "premium-1bot":
+            expected = PRICE_STARS
+        elif payload.startswith("monthly:"):
+            expected = MONTHLY_STARS
+        elif payload.startswith("wallet:"):
+            try:
+                expected = int(payload.split(":", 1)[1])
+            except ValueError:
+                await q.answer(ok=False, error_message="Noma'lum to'lov.")
+                return
+        else:
             await q.answer(ok=False, error_message="Noma'lum to'lov.")
             return
-        if q.currency != "XTR" or q.total_amount != PRICE_STARS:
+        if q.currency != "XTR" or q.total_amount != expected:
             await q.answer(ok=False, error_message="To'lov summasi noto'g'ri.")
             return
         await q.answer(ok=True)
@@ -1480,7 +2095,59 @@ def build_app():
     async def successful_payment(update, context):
         pay = update.message.successful_payment
         user = update.effective_user
-        if pay is None or pay.invoice_payload != "premium-1bot":
+        if pay is None:
+            return
+        payload = pay.invoice_payload or ""
+        if payload.startswith("wallet:"):
+            try:
+                stars = int(payload.split(":", 1)[1])
+            except ValueError:
+                return
+            som = stars * WALLET_STAR_RATE
+            record_payment(user.id, user.username or "", pay.total_amount, payload)
+            new_balance = add_balance(user.id, som)
+            await update.message.reply_text(
+                f"✅ Hamyon to'ldirildi: {stars} ⭐ = {som:,} so'm\n"
+                f"💰 Balans endi: {new_balance:,} so'm.",
+                reply_markup=main_menu(user.id),
+            )
+            if SUPER_ADMIN_ID:
+                try:
+                    await context.bot.send_message(
+                        chat_id=SUPER_ADMIN_ID,
+                        text=f"💰 Yangi hamyon to'lovi: @{user.username or user.id} ({user.id}) — "
+                             f"{stars} ⭐ = {som:,} so'm, balans: {new_balance:,} so'm.",
+                    )
+                except Exception:
+                    pass
+            return
+        if payload.startswith("monthly:"):
+            try:
+                bot_id = int(payload.split(":", 1)[1])
+            except ValueError:
+                return
+            row = get_bot(bot_id)
+            if row is None or row["owner_id"] != user.id:
+                return
+            record_payment(user.id, user.username or "", pay.total_amount, payload)
+            new_until = extend_monthly(bot_id)
+            await update.message.reply_text(
+                f"✅ Oylik to'lov qabul qilindi: {pay.total_amount} ⭐\n"
+                f"💳 Bot #{bot_id} oyligi {new_until[:10]} gacha uzaytirildi.\n"
+                "Botni «🤖 Mening botlarim» dan ishga tushirishingiz mumkin.",
+                reply_markup=main_menu(user.id),
+            )
+            if SUPER_ADMIN_ID:
+                try:
+                    await context.bot.send_message(
+                        chat_id=SUPER_ADMIN_ID,
+                        text=f"💰 Yangi oylik Stars to'lovi: @{user.username or user.id} ({user.id}) — "
+                             f"Bot #{bot_id}, {pay.total_amount} ⭐, {new_until[:10]} gacha.",
+                    )
+                except Exception:
+                    pass
+            return
+        if payload != "premium-1bot":
             return
         record_payment(user.id, user.username or "", pay.total_amount, pay.invoice_payload)
         credits = grant_credit(user.id, by="stars")
@@ -1517,14 +2184,25 @@ def build_app():
             return
         rows = list_premium_users()
         lines = "\n".join(f"• {r['user_id']} — {r['credits']} ta kredit" for r in rows) or "Hozircha premium foydalanuvchi yo'q."
+        _card_info = get_config("card_info") or "(hali kiritilmagan)"
+        _pending = len(list_pending_card_payments())
         await update.message.reply_text(
             "🛡 Admin panel (super admin)\n\n"
             f"👥 Premium foydalanuvchilar ({len(rows)}):\n{lines}\n\n"
             f"📊 Jami botlar: {count_bots_total()} / {MAX_BOTS}\n"
+            f"💳 Oylik: {MONTHLY_SOM:,} so'm / {MONTHLY_STARS} ⭐ (30 kun)\n"
+            f"💳 Karta ma'lumoti: {_card_info}\n"
+            f"📋 Kutilayotgan karta to'lovlari: {_pending} ta\n\n"
             "Premium berish uchun foydalanuvchi Telegram ID sini yuboring — "
-            "avval «➕ Premium berish», olish uchun «➖ Premium olish» ni bosing.",
+            "avval «➕ Premium berish», olish uchun «➖ Premium olish» ni bosing.\n"
+            "📣 Elon — server botning barcha foydalanuvchilariga boradi.",
             reply_markup=ReplyKeyboardMarkup(
-                _colored([["➕ Premium berish", "➖ Premium olish"], ["👥 Premiumlar", "⬅️ Orqaga"]]),
+                _colored([
+                    ["➕ Premium berish", "➖ Premium olish"],
+                    ["📣 Elon yuborish", "💳 Karta ma'lumoti"],
+                    ["📋 Karta to'lovlari", "👥 Premiumlar"],
+                    ["⬅️ Orqaga"],
+                ]),
                 resize_keyboard=True,
             ),
         )
@@ -1914,6 +2592,8 @@ def build_app():
             return await show_help(update, context)
         if text == BTN_PREMIUM:
             return await show_premium(update, context)
+        if text == BTN_WALLET:
+            return await show_wallet(update, context)
         if text == BTN_ADMIN:
             return await show_admin(update, context)
         if text == "➕ Premium berish":
@@ -1935,6 +2615,71 @@ def build_app():
                 await update.message.reply_text("Faqat super admin ko'ra oladi.")
                 return
             return await admin_list(update, context)
+        if text == "📣 Elon yuborish":
+            if not is_super_admin(update.effective_user.id):
+                await update.message.reply_text("Faqat super admin elon yubora oladi.")
+                return
+            context.user_data["await"] = "announce"
+            await update.message.reply_text(
+                "📣 Elon matnini yuboring — u server botning barcha "
+                "foydalanuvchilariga (users jadvali) yuboriladi."
+            )
+            return
+        if text == "💳 Karta ma'lumoti":
+            if not is_super_admin(update.effective_user.id):
+                await update.message.reply_text("Faqat super admin o'zgartira oladi.")
+                return
+            context.user_data["await"] = "card_info"
+            await update.message.reply_text(
+                "💳 Karta to'lov ma'lumotini yuboring — masalan, karta raqami va "
+                "Click/Payme izohi. Shu matn oylik to'lovda foydalanuvchilarga ko'rinadi.\n"
+                "Hozirgisi: " + (get_config("card_info") or "(yo'q)")
+            )
+            return
+        if text == "📋 Karta to'lovlari":
+            if not is_super_admin(update.effective_user.id):
+                await update.message.reply_text("Faqat super admin ko'ra oladi.")
+                return
+            pending = list_pending_card_payments()
+            if not pending:
+                await update.message.reply_text("📋 Kutilayotgan karta to'lovi yo'q.")
+                return
+            for req in pending:
+                kb = InlineKeyboardMarkup([[
+                    _ibtn("✅ Tasdiqlash", callback_data=f"cardpay:approve:{req['id']}"),
+                    _ibtn("❌ Rad etish", callback_data=f"cardpay:reject:{req['id']}"),
+                ]])
+                _purpose = "hamyon" if int(req["bot_id"]) == 0 else f"Bot #{req['bot_id']}"
+                await update.message.reply_text(
+                    f"💳 So'rov #{req['id']}: foydalanuvchi {req['user_id']}, "
+                    f"{_purpose}, {req['amount_som']:,} so'm, {req['created_at']}",
+                    reply_markup=kb,
+                )
+            return
+        if context.user_data.get("await") == "announce":
+            context.user_data.pop("await", None)
+            import asyncio as _asyncio
+
+            users = get_all_users()
+            ok_count = 0
+            fail_count = 0
+            for u in users:
+                try:
+                    await context.bot.send_message(chat_id=u["user_id"], text=f"📣 Elon\n\n{text}")
+                    ok_count += 1
+                except Exception:
+                    fail_count += 1
+                await _asyncio.sleep(0.05)
+            await update.message.reply_text(
+                f"📣 Elon yuborildi: {ok_count} ta yetdi, {fail_count} ta yetmadi "
+                f"(jami {len(users)} foydalanuvchi)."
+            )
+            return
+        if context.user_data.get("await") == "card_info":
+            context.user_data.pop("await", None)
+            set_config("card_info", text)
+            await update.message.reply_text("✅ Karta ma'lumoti saqlandi. Endi oylik to'lovda ko'rinadi.")
+            return
         if text == "⬅️ Orqaga":
             context.user_data.pop("await", None)
             await update.message.reply_text("Asosiy menyu 👇", reply_markup=main_menu(update.effective_user.id))
@@ -1957,7 +2702,14 @@ def build_app():
             return
         await update.message.reply_text("Menyudan tanlang 👇", reply_markup=main_menu(update.effective_user.id))
 
+    async def handle_photo(update, context):
+        if context.user_data.get("await") == "card_check":
+            return await handle_card_check_photo(update, context)
+        await update.message.reply_text("Menyudan tanlang 👇", reply_markup=main_menu(update.effective_user.id))
+
     async def handle_doc(update, context):
+        if context.user_data.get("await") == "card_check":
+            return await handle_card_check_photo(update, context)
         if context.user_data.get("await") == "code":
             return await handle_code_doc(update, context)
         if context.user_data.get("await") == "code_update":
@@ -1969,6 +2721,11 @@ def build_app():
     async def post_init(app):
         init_db()
         restore_running_bots()
+        # Har soatda oylik tekshiruvi: muddati tugagan botning oyligi
+        # hamyondan avtomatik yechiladi, balans yetmasa bot to'xtatiladi.
+        import asyncio as _asyncio
+
+        _asyncio.create_task(monthly_wallet_loop(app))
         log.info("Server bot ishga tushdi, faol botlar qayta yoqildi")
 
     from telegram.ext import PreCheckoutQueryHandler
@@ -1980,8 +2737,12 @@ def build_app():
     app.add_handler(CallbackQueryHandler(make_feature_toggle, pattern=r"^makefeat:"))
     app.add_handler(CallbackQueryHandler(make_style_choice, pattern=r"^makestyle:"))
     app.add_handler(CallbackQueryHandler(pay_stars, pattern=r"^pay:"))
+    app.add_handler(CallbackQueryHandler(monthly_router, pattern=r"^monthly:"))
+    app.add_handler(CallbackQueryHandler(wallet_router, pattern=r"^wallet:"))
+    app.add_handler(CallbackQueryHandler(cardpay_decide, pattern=r"^cardpay:"))
     app.add_handler(PreCheckoutQueryHandler(precheckout))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_doc))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     return app
