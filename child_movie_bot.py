@@ -374,27 +374,46 @@ def build_app():
             out.append([KeyboardButton(cell, style=_reply_style(cell)) if _reply_style(cell) else cell for cell in row])
         return out
 
-    def _ibtn(text, cb):
+    def _ibtn(text, cb=None, callback_data=None, url=None):
+        cb = cb or callback_data
         if PANEL_STYLE != "colorful":
+            if url is not None:
+                return InlineKeyboardButton(text, url=url)
             return InlineKeyboardButton(text, callback_data=cb)
-        if cb == "admin:delete":
+        low_cb = (cb or "").lower()
+        low_text = str(text).lower()
+        if ("del" in low_cb or "delete" in low_cb or "close" in low_cb or "reject" in low_cb
+                or "o'chirish" in low_text or "yopish" in low_text or "rad etish" in low_text
+                or low_text.startswith("🗑") or low_text.startswith("❌")):
             style = "danger"
-        elif cb == "admin:premium":
+        elif ("prem" in low_cb or "accept" in low_cb or "give" in low_cb
+                or "premium" in low_text or "tasdiqlash" in low_text or "yuklash" in low_text
+                or "tekshirish" in low_text or "qo'shish" in low_text):
             style = "success"
         else:
             style = "primary"
+        if url is not None:
+            return InlineKeyboardButton(text, url=url, style=style)
         return InlineKeyboardButton(text, callback_data=cb, style=style)
 
     def menu_for(update):
         if is_owner(update):
+            # Foydalanuvchi paneli alohida: asosiy menyuda faqat foydalanuvchi
+            # tugmalari + bitta "Admin panel" kirish tugmasi. Qo'shish
+            # tugmalari faqat Admin panel ichida ko'rinadi.
             rows = [[BTN_LIST, BTN_NEW], [BTN_TOP, BTN_TRAILERS] if "shorts" in FEATURES else [BTN_TOP],
-                    [BTN_ADD, BTN_ADD_TR] if "shorts" in FEATURES else [BTN_ADD], [BTN_ADMIN]]
+                    [BTN_ADMIN]]
             return ReplyKeyboardMarkup(_wrap_reply(rows), resize_keyboard=True)
         rows = [[BTN_LIST, BTN_NEW], [BTN_TOP, BTN_TRAILERS] if "shorts" in FEATURES else [BTN_TOP]]
         return ReplyKeyboardMarkup(_wrap_reply(rows), resize_keyboard=True)
 
     def admin_keyboard():
         rows = [
+            [_ibtn("➕ Kino qo'shish", "admin:add_movie")],
+        ]
+        if "shorts" in FEATURES:
+            rows[0].append(_ibtn("🎬 Treyler qo'shish", "admin:add_trailer"))
+        rows += [
             [_ibtn("📊 Statistika", "admin:stats"),
              _ibtn("👥 Foydalanuvchilar", "admin:users")],
             [_ibtn("✏️ Tahrirlash", "admin:edit"),
@@ -437,8 +456,8 @@ def build_app():
                 continue
         if not missing:
             return True
-        kb = [[InlineKeyboardButton(f"📺 @{ch}", url=f"https://t.me/{ch}")] for ch in missing]
-        kb.append([InlineKeyboardButton("✅ Obuna bo'ldim, tekshirish", callback_data="back:list")])
+        kb = [[_ibtn(f"📺 @{ch}", url=f"https://t.me/{ch}")] for ch in missing]
+        kb.append([_ibtn("✅ Obuna bo'ldim, tekshirish", callback_data="back:list")])
         text = ("❌ Botdan foydalanish uchun avval quyidagi kanallarga obuna bo'ling:\n\n"
                 + "\n".join(f"• @{ch}" for ch in missing)
                 + "\n\nObuna bo'lgach, «✅ Obuna bo'ldim» ni bosing.")
@@ -495,8 +514,8 @@ def build_app():
         kb = []
         for r in rows:
             label = f"{'⭐ ' if r['is_premium'] else ''}{r['title']} (kod {r['id']})"
-            kb.append([InlineKeyboardButton(label, callback_data=f"{prefix}:{r['id']}")])
-        kb.append([InlineKeyboardButton("⬅️ Orqaga", callback_data="back:list")])
+            kb.append([_ibtn(label, callback_data=f"{prefix}:{r['id']}")])
+        kb.append([_ibtn("⬅️ Orqaga", callback_data="back:list")])
         return InlineKeyboardMarkup(kb)
 
     async def send_movie_list(update, context, query="", order="id", title="Kinolar ro'yxati:"):
@@ -525,8 +544,8 @@ def build_app():
         if not movie:
             return
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("▶ Tomosha qilish", callback_data=f"watch:{movie_id}")],
-            [InlineKeyboardButton("⬅️ Ro'yxatga qaytish", callback_data="back:list")],
+            [_ibtn("▶ Tomosha qilish", callback_data=f"watch:{movie_id}")],
+            [_ibtn("⬅️ Ro'yxatga qaytish", callback_data="back:list")],
         ])
         q = update.callback_query
         if movie["poster_file_id"]:
@@ -569,7 +588,20 @@ def build_app():
         if not is_owner(update):
             return
         action = (q.data or "").split(":", 1)[1] if ":" in (q.data or "") else ""
-        if action == "stats":
+        if action == "add_movie":
+            context.user_data["await"] = "movie_title"
+            await q.message.reply_text("Yangi kino nomini yozing:")
+        elif action == "add_trailer":
+            if "shorts" not in FEATURES:
+                await q.message.reply_text("Bu funksiya bu botda o'chirilgan.")
+                return
+            rows = list_movies()
+            if not rows:
+                await q.message.reply_text("Avval kino qo'shing — ro'yxat bo'sh.")
+                return
+            await q.message.reply_text("Qaysi kinoga treyler qo'shiladi?",
+                                       reply_markup=movies_keyboard(rows, prefix="traileradd"))
+        elif action == "stats":
             await q.edit_message_text(stats_text(), reply_markup=admin_keyboard())
         elif action == "users":
             rows = list_users()
@@ -583,14 +615,14 @@ def build_app():
             if not rows:
                 await q.edit_message_text("O'chiriladigan kino yo'q.", reply_markup=admin_keyboard())
                 return
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton(f"🗑 {r['title']}", callback_data=f"delmovie:{r['id']}")] for r in rows])
+            kb = InlineKeyboardMarkup([[_ibtn(f"🗑 {r['title']}", callback_data=f"delmovie:{r['id']}")] for r in rows])
             await q.edit_message_text("Qaysi kino o'chirilsin? (treylerlari ham o'chadi)", reply_markup=kb)
         elif action == "edit":
             rows = list_movies()
             if not rows:
                 await q.edit_message_text("Tahrirlanadigan kino yo'q.", reply_markup=admin_keyboard())
                 return
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton(f"✏️ {r['title']}", callback_data=f"editmovie:{r['id']}")] for r in rows])
+            kb = InlineKeyboardMarkup([[_ibtn(f"✏️ {r['title']}", callback_data=f"editmovie:{r['id']}")] for r in rows])
             await q.edit_message_text("Qaysi kino tahrirlanadi?", reply_markup=kb)
         elif action == "broadcast":
             context.user_data["await"] = "broadcast"
@@ -600,7 +632,7 @@ def build_app():
             if not rows:
                 await q.edit_message_text("Post qilinadigan kino yo'q.", reply_markup=admin_keyboard())
                 return
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton(f"📤 {r['title']}", callback_data=f"postmovie:{r['id']}")] for r in rows])
+            kb = InlineKeyboardMarkup([[_ibtn(f"📤 {r['title']}", callback_data=f"postmovie:{r['id']}")] for r in rows])
             await q.edit_message_text("Qaysi kino post qilinsin?", reply_markup=kb)
         elif action == "channels":
             chs = get_channels()
@@ -608,11 +640,11 @@ def build_app():
             txt = ("📺 Obuna kanallari:\n" + ("\n".join(f"• @{c}" for c in chs) or "—")
                    + "\n\n📤 Post kanallari:\n" + ("\n".join(f"• @{c}" for c in pchs) or "—"))
             kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("➕ Obuna kanal qo'shish", callback_data="admin:chadd"),
-                 InlineKeyboardButton("➖ Obuna kanal o'chirish", callback_data="admin:chdel")],
-                [InlineKeyboardButton("➕ Post kanal qo'shish", callback_data="admin:pchadd"),
-                 InlineKeyboardButton("➖ Post kanal o'chirish", callback_data="admin:pchdel")],
-                [InlineKeyboardButton("⬅️ Admin panel", callback_data="admin:back")],
+                [_ibtn("➕ Obuna kanal qo'shish", callback_data="admin:chadd"),
+                 _ibtn("➖ Obuna kanal o'chirish", callback_data="admin:chdel")],
+                [_ibtn("➕ Post kanal qo'shish", callback_data="admin:pchadd"),
+                 _ibtn("➖ Post kanal o'chirish", callback_data="admin:pchdel")],
+                [_ibtn("⬅️ Admin panel", callback_data="admin:back")],
             ])
             await q.edit_message_text(txt, reply_markup=kb)
         elif action == "chadd":
@@ -623,7 +655,7 @@ def build_app():
             if not chs:
                 await q.edit_message_text("O'chiriladigan kanal yo'q.", reply_markup=admin_keyboard())
                 return
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton(f"❌ @{c}", callback_data=f"delchan:{c}")] for c in chs])
+            kb = InlineKeyboardMarkup([[_ibtn(f"❌ @{c}", callback_data=f"delchan:{c}")] for c in chs])
             await q.edit_message_text("Qaysi obuna kanal o'chirilsin?", reply_markup=kb)
         elif action == "pchadd":
             context.user_data["await"] = "post_channel_add"
@@ -633,13 +665,13 @@ def build_app():
             if not chs:
                 await q.edit_message_text("O'chiriladigan post kanal yo'q.", reply_markup=admin_keyboard())
                 return
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton(f"❌ @{c}", callback_data=f"delpchan:{c}")] for c in chs])
+            kb = InlineKeyboardMarkup([[_ibtn(f"❌ @{c}", callback_data=f"delpchan:{c}")] for c in chs])
             await q.edit_message_text("Qaysi post kanal o'chirilsin?", reply_markup=kb)
         elif action == "storage":
             cur = get_setting("storage_channel", "") or "o'rnatilmagan"
             kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("✏️ Saqlash kanalini o'rnatish", callback_data="admin:storage_set")],
-                [InlineKeyboardButton("⬅️ Admin panel", callback_data="admin:back")],
+                [_ibtn("✏️ Saqlash kanalini o'rnatish", callback_data="admin:storage_set")],
+                [_ibtn("⬅️ Admin panel", callback_data="admin:back")],
             ])
             await q.edit_message_text(
                 f"📦 Saqlash kanali (ko'chma baza)\n\nHozirgi: {cur}\n\n"
@@ -655,9 +687,9 @@ def build_app():
             rows = list_premium()
             txt = "⭐ Premium foydalanuvchilar:\n" + ("\n".join(f"• {r['user_id']}" + (f" (@{r['username']})" if r["username"] else "") for r in rows) or "—")
             kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("➕ Premium berish", callback_data="admin:prem_give"),
-                 InlineKeyboardButton("➖ Premium olish", callback_data="admin:prem_revoke")],
-                [InlineKeyboardButton("⬅️ Admin panel", callback_data="admin:back")],
+                [_ibtn("➕ Premium berish", callback_data="admin:prem_give"),
+                 _ibtn("➖ Premium olish", callback_data="admin:prem_revoke")],
+                [_ibtn("⬅️ Admin panel", callback_data="admin:back")],
             ])
             await q.edit_message_text(txt, reply_markup=kb)
         elif action == "prem_give":
@@ -790,12 +822,12 @@ def build_app():
             if not movie:
                 return
             kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("✏️ Nomini o'zgartirish", callback_data=f"edittitle:{mid}"),
-                 InlineKeyboardButton("🖼 Poster almashtirish", callback_data=f"editposter:{mid}")],
-                [InlineKeyboardButton("🎬 Video almashtirish", callback_data=f"editvideo:{mid}"),
-                 InlineKeyboardButton("⭐ Premium: " + ("O'chirish" if movie["is_premium"] else "Yoqish"), callback_data=f"editprem:{mid}")],
-                [InlineKeyboardButton("🎬 Treyler o'chirish", callback_data=f"editdeltrailer:{mid}")],
-                [InlineKeyboardButton("⬅️ Admin panel", callback_data="admin:back")],
+                [_ibtn("✏️ Nomini o'zgartirish", callback_data=f"edittitle:{mid}"),
+                 _ibtn("🖼 Poster almashtirish", callback_data=f"editposter:{mid}")],
+                [_ibtn("🎬 Video almashtirish", callback_data=f"editvideo:{mid}"),
+                 _ibtn("⭐ Premium: " + ("O'chirish" if movie["is_premium"] else "Yoqish"), callback_data=f"editprem:{mid}")],
+                [_ibtn("🎬 Treyler o'chirish", callback_data=f"editdeltrailer:{mid}")],
+                [_ibtn("⬅️ Admin panel", callback_data="admin:back")],
             ])
             await q.edit_message_text(f"✏️ Tahrirlash: {movie['title']}\n{movie_card(movie)}", reply_markup=kb)
         elif kind == "edittitle":
@@ -832,7 +864,7 @@ def build_app():
             if not trs:
                 await q.edit_message_text("O'chiriladigan treyler yo'q.")
                 return
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton(f"🗑 {t['title'] or t['id']}", callback_data=f"deltrailer:{t['id']}")] for t in trs])
+            kb = InlineKeyboardMarkup([[_ibtn(f"🗑 {t['title'] or t['id']}", callback_data=f"deltrailer:{t['id']}")] for t in trs])
             await q.edit_message_text("Qaysi treyler o'chirilsin?", reply_markup=kb)
         elif kind == "postmovie":
             if not is_owner(update):
@@ -952,7 +984,7 @@ def build_app():
             if not trs:
                 await update.message.reply_text("Hozircha treyler yo'q.")
                 return
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton(f"🎬 {t['title'] or 'Treyler'}", callback_data=f"trailer:{t['id']}")] for t in trs])
+            kb = InlineKeyboardMarkup([[_ibtn(f"🎬 {t['title'] or 'Treyler'}", callback_data=f"trailer:{t['id']}")] for t in trs])
             await update.message.reply_text("🎬 Treylerlar:", reply_markup=kb)
             return
         if is_owner(update) and text == BTN_ADD:

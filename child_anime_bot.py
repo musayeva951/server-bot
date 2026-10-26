@@ -431,31 +431,47 @@ def build_app():
             out.append([KeyboardButton(cell, style=_reply_style(cell)) if _reply_style(cell) else cell for cell in row])
         return out
 
-    def _ibtn(text, cb):
+    def _ibtn(text, cb=None, callback_data=None, url=None):
+        cb = cb or callback_data
         if PANEL_STYLE != "colorful":
+            if url is not None:
+                return InlineKeyboardButton(text, url=url)
             return InlineKeyboardButton(text, callback_data=cb)
-        if cb == "admin:delete":
+        low_cb = (cb or "").lower()
+        low_text = str(text).lower()
+        if ("del" in low_cb or "delete" in low_cb or "close" in low_cb or "reject" in low_cb
+                or "o'chirish" in low_text or "yopish" in low_text or "rad etish" in low_text
+                or low_text.startswith("🗑") or low_text.startswith("❌")):
             style = "danger"
-        elif cb == "admin:premium":
+        elif ("prem" in low_cb or "accept" in low_cb or "give" in low_cb
+                or "premium" in low_text or "tasdiqlash" in low_text or "yuklash" in low_text
+                or "tekshirish" in low_text or "qo'shish" in low_text):
             style = "success"
         else:
             style = "primary"
+        if url is not None:
+            return InlineKeyboardButton(text, url=url, style=style)
         return InlineKeyboardButton(text, callback_data=cb, style=style)
 
     def menu_for(update):
         if is_owner(update):
+            # Foydalanuvchi paneli alohida: asosiy menyuda faqat foydalanuvchi
+            # tugmalari + bitta "Admin panel" kirish tugmasi. Qo'shish
+            # tugmalari faqat Admin panel ichida ko'rinadi.
             rows = [[BTN_LIST, BTN_NEW], [BTN_TOP, BTN_SHORTS] if "shorts" in FEATURES else [BTN_TOP],
-                    [BTN_ADD_ANIME, BTN_ADD_EP]]
-            if "shorts" in FEATURES:
-                rows.append([BTN_ADD_SHORT, BTN_ADMIN])
-            else:
-                rows.append([BTN_ADMIN])
+                    [BTN_ADMIN]]
             return ReplyKeyboardMarkup(_wrap_reply(rows), resize_keyboard=True)
         rows = [[BTN_LIST, BTN_NEW], [BTN_TOP, BTN_SHORTS] if "shorts" in FEATURES else [BTN_TOP]]
         return ReplyKeyboardMarkup(_wrap_reply(rows), resize_keyboard=True)
 
     def admin_keyboard():
         rows = [
+            [_ibtn("➕ Anime qo'shish", "admin:add_anime"),
+             _ibtn("🎞 Qism qo'shish", "admin:add_ep")],
+        ]
+        if "shorts" in FEATURES:
+            rows.append([_ibtn("📱 Short qo'shish", "admin:add_short")])
+        rows += [
             [_ibtn("📊 Statistika", "admin:stats"),
              _ibtn("👥 Foydalanuvchilar", "admin:users")],
             [_ibtn("✏️ Tahrirlash", "admin:edit"),
@@ -479,7 +495,7 @@ def build_app():
         return InlineKeyboardMarkup(rows)
 
     def back_kb():
-        return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Orqaga", callback_data="back:list")]])
+        return InlineKeyboardMarkup([[_ibtn("⬅️ Orqaga", callback_data="back:list")]])
 
     async def check_subscription(update, context) -> bool:
         if "sub" not in FEATURES:
@@ -503,8 +519,8 @@ def build_app():
                 continue
         if not missing:
             return True
-        kb = [[InlineKeyboardButton(f"📺 @{ch}", url=f"https://t.me/{ch}")] for ch in missing]
-        kb.append([InlineKeyboardButton("✅ Obuna bo'ldim, tekshirish", callback_data="back:list")])
+        kb = [[_ibtn(f"📺 @{ch}", url=f"https://t.me/{ch}")] for ch in missing]
+        kb.append([_ibtn("✅ Obuna bo'ldim, tekshirish", callback_data="back:list")])
         text = ("❌ Botdan foydalanish uchun avval quyidagi kanallarga obuna bo'ling:\n\n"
                 + "\n".join(f"• @{ch}" for ch in missing)
                 + "\n\nObuna bo'lgach, «✅ Obuna bo'ldim» ni bosing.")
@@ -566,8 +582,8 @@ def build_app():
         kb = []
         for r in rows:
             label = f"{'⭐ ' if r['is_premium'] else ''}{r['title']} (kod {r['id']})"
-            kb.append([InlineKeyboardButton(label, callback_data=f"{prefix}:{r['id']}")])
-        kb.append([InlineKeyboardButton("⬅️ Orqaga", callback_data="back:list")])
+            kb.append([_ibtn(label, callback_data=f"{prefix}:{r['id']}")])
+        kb.append([_ibtn("⬅️ Orqaga", callback_data="back:list")])
         return InlineKeyboardMarkup(kb) if kb else None
 
     async def send_anime_list(update, context, query="", order="id", title="Animelar ro'yxati:"):
@@ -595,8 +611,8 @@ def build_app():
         kb_rows = []
         eps = list_episodes(anime_id)
         for e in eps:
-            kb_rows.append([InlineKeyboardButton(f"{e['ep_no']}-qism", callback_data=f"ep:{e['id']}")])
-        kb_rows.append([InlineKeyboardButton("⬅️ Ro'yxatga qaytish", callback_data="back:list")])
+            kb_rows.append([_ibtn(f"{e['ep_no']}-qism", callback_data=f"ep:{e['id']}")])
+        kb_rows.append([_ibtn("⬅️ Ro'yxatga qaytish", callback_data="back:list")])
         kb = InlineKeyboardMarkup(kb_rows)
         q = update.callback_query
         if anime["poster_file_id"]:
@@ -641,7 +657,27 @@ def build_app():
         if not is_owner(update):
             return
         action = (q.data or "").split(":", 1)[1] if ":" in (q.data or "") else ""
-        if action == "stats":
+        if action == "add_anime":
+            context.user_data["await"] = "anime_title"
+            await q.message.reply_text("Yangi anime nomini yozing:")
+        elif action == "add_ep":
+            rows = list_animes()
+            if not rows:
+                await q.message.reply_text("Avval anime qo'shing — ro'yxat bo'sh.")
+                return
+            await q.message.reply_text("Qaysi animega qism qo'shiladi?",
+                                       reply_markup=animes_keyboard(rows, prefix="epadd"))
+        elif action == "add_short":
+            if "shorts" not in FEATURES:
+                await q.message.reply_text("Bu funksiya bu botda o'chirilgan.")
+                return
+            rows = list_animes()
+            if not rows:
+                await q.message.reply_text("Avval anime qo'shing — ro'yxat bo'sh.")
+                return
+            await q.message.reply_text("Qaysi animega short qo'shiladi?",
+                                       reply_markup=animes_keyboard(rows, prefix="shortadd"))
+        elif action == "stats":
             await q.edit_message_text(stats_text(), reply_markup=admin_keyboard())
         elif action == "users":
             rows = list_users()
@@ -655,14 +691,14 @@ def build_app():
             if not rows:
                 await q.edit_message_text("O'chiriladigan anime yo'q.", reply_markup=admin_keyboard())
                 return
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton(f"🗑 {r['title']}", callback_data=f"delanime:{r['id']}")] for r in rows])
+            kb = InlineKeyboardMarkup([[_ibtn(f"🗑 {r['title']}", callback_data=f"delanime:{r['id']}")] for r in rows])
             await q.edit_message_text("Qaysi anime o'chirilsin? (qismlari va shortlari ham o'chadi)", reply_markup=kb)
         elif action == "edit":
             rows = list_animes()
             if not rows:
                 await q.edit_message_text("Tahrirlanadigan anime yo'q.", reply_markup=admin_keyboard())
                 return
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton(f"✏️ {r['title']}", callback_data=f"editanime:{r['id']}")] for r in rows])
+            kb = InlineKeyboardMarkup([[_ibtn(f"✏️ {r['title']}", callback_data=f"editanime:{r['id']}")] for r in rows])
             await q.edit_message_text("Qaysi anime tahrirlanadi?", reply_markup=kb)
         elif action == "broadcast":
             context.user_data["await"] = "broadcast"
@@ -672,7 +708,7 @@ def build_app():
             if not rows:
                 await q.edit_message_text("Post qilinadigan anime yo'q.", reply_markup=admin_keyboard())
                 return
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton(f"📤 {r['title']}", callback_data=f"postanime:{r['id']}")] for r in rows])
+            kb = InlineKeyboardMarkup([[_ibtn(f"📤 {r['title']}", callback_data=f"postanime:{r['id']}")] for r in rows])
             await q.edit_message_text("Qaysi anime post qilinsin?", reply_markup=kb)
         elif action == "channels":
             chs = get_channels()
@@ -680,11 +716,11 @@ def build_app():
             txt = ("📺 Obuna kanallari:\n" + ("\n".join(f"• @{c}" for c in chs) or "—")
                    + "\n\n📤 Post kanallari:\n" + ("\n".join(f"• @{c}" for c in pchs) or "—"))
             kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("➕ Obuna kanal qo'shish", callback_data="admin:chadd"),
-                 InlineKeyboardButton("➖ Obuna kanal o'chirish", callback_data="admin:chdel")],
-                [InlineKeyboardButton("➕ Post kanal qo'shish", callback_data="admin:pchadd"),
-                 InlineKeyboardButton("➖ Post kanal o'chirish", callback_data="admin:pchdel")],
-                [InlineKeyboardButton("⬅️ Admin panel", callback_data="admin:back")],
+                [_ibtn("➕ Obuna kanal qo'shish", callback_data="admin:chadd"),
+                 _ibtn("➖ Obuna kanal o'chirish", callback_data="admin:chdel")],
+                [_ibtn("➕ Post kanal qo'shish", callback_data="admin:pchadd"),
+                 _ibtn("➖ Post kanal o'chirish", callback_data="admin:pchdel")],
+                [_ibtn("⬅️ Admin panel", callback_data="admin:back")],
             ])
             await q.edit_message_text(txt, reply_markup=kb)
         elif action == "chadd":
@@ -695,7 +731,7 @@ def build_app():
             if not chs:
                 await q.edit_message_text("O'chiriladigan kanal yo'q.", reply_markup=admin_keyboard())
                 return
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton(f"❌ @{c}", callback_data=f"delchan:{c}")] for c in chs])
+            kb = InlineKeyboardMarkup([[_ibtn(f"❌ @{c}", callback_data=f"delchan:{c}")] for c in chs])
             await q.edit_message_text("Qaysi obuna kanal o'chirilsin?", reply_markup=kb)
         elif action == "pchadd":
             context.user_data["await"] = "post_channel_add"
@@ -705,13 +741,13 @@ def build_app():
             if not chs:
                 await q.edit_message_text("O'chiriladigan post kanal yo'q.", reply_markup=admin_keyboard())
                 return
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton(f"❌ @{c}", callback_data=f"delpchan:{c}")] for c in chs])
+            kb = InlineKeyboardMarkup([[_ibtn(f"❌ @{c}", callback_data=f"delpchan:{c}")] for c in chs])
             await q.edit_message_text("Qaysi post kanal o'chirilsin?", reply_markup=kb)
         elif action == "storage":
             cur = get_setting("storage_channel", "") or "o'rnatilmagan"
             kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("✏️ Saqlash kanalini o'rnatish", callback_data="admin:storage_set")],
-                [InlineKeyboardButton("⬅️ Admin panel", callback_data="admin:back")],
+                [_ibtn("✏️ Saqlash kanalini o'rnatish", callback_data="admin:storage_set")],
+                [_ibtn("⬅️ Admin panel", callback_data="admin:back")],
             ])
             await q.edit_message_text(
                 f"📦 Saqlash kanali (ko'chma baza)\n\nHozirgi: {cur}\n\n"
@@ -727,9 +763,9 @@ def build_app():
             rows = list_premium()
             txt = "⭐ Premium foydalanuvchilar:\n" + ("\n".join(f"• {r['user_id']}" + (f" (@{r['username']})" if r["username"] else "") for r in rows) or "—")
             kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("➕ Premium berish", callback_data="admin:prem_give"),
-                 InlineKeyboardButton("➖ Premium olish", callback_data="admin:prem_revoke")],
-                [InlineKeyboardButton("⬅️ Admin panel", callback_data="admin:back")],
+                [_ibtn("➕ Premium berish", callback_data="admin:prem_give"),
+                 _ibtn("➖ Premium olish", callback_data="admin:prem_revoke")],
+                [_ibtn("⬅️ Admin panel", callback_data="admin:back")],
             ])
             await q.edit_message_text(txt, reply_markup=kb)
         elif action == "prem_give":
@@ -885,13 +921,13 @@ def build_app():
             if not anime:
                 return
             kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("✏️ Nomini o'zgartirish", callback_data=f"edittitle:{anime_id}"),
-                 InlineKeyboardButton("🖼 Poster almashtirish", callback_data=f"editposter:{anime_id}")],
-                [InlineKeyboardButton("⭐ Premium: " + ("O'chirish" if anime["is_premium"] else "Yoqish"), callback_data=f"editprem:{anime_id}")],
-                [InlineKeyboardButton("🎞 Qism almashtirish", callback_data=f"editrepep:{anime_id}"),
-                 InlineKeyboardButton("🗑 Qism o'chirish", callback_data=f"editdelep:{anime_id}")],
-                [InlineKeyboardButton("📱 Short o'chirish", callback_data=f"editdelshort:{anime_id}")],
-                [InlineKeyboardButton("⬅️ Admin panel", callback_data="admin:back")],
+                [_ibtn("✏️ Nomini o'zgartirish", callback_data=f"edittitle:{anime_id}"),
+                 _ibtn("🖼 Poster almashtirish", callback_data=f"editposter:{anime_id}")],
+                [_ibtn("⭐ Premium: " + ("O'chirish" if anime["is_premium"] else "Yoqish"), callback_data=f"editprem:{anime_id}")],
+                [_ibtn("🎞 Qism almashtirish", callback_data=f"editrepep:{anime_id}"),
+                 _ibtn("🗑 Qism o'chirish", callback_data=f"editdelep:{anime_id}")],
+                [_ibtn("📱 Short o'chirish", callback_data=f"editdelshort:{anime_id}")],
+                [_ibtn("⬅️ Admin panel", callback_data="admin:back")],
             ])
             await q.edit_message_text(f"✏️ Tahrirlash: {anime['title']}\n{anime_card(anime)}", reply_markup=kb)
         elif kind == "edittitle":
@@ -922,7 +958,7 @@ def build_app():
             if not eps:
                 await q.edit_message_text("Almashtiriladigan qism yo'q.")
                 return
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton(f"🔄 {e['ep_no']}-qism", callback_data=f"repep:{e['id']}")] for e in eps])
+            kb = InlineKeyboardMarkup([[_ibtn(f"🔄 {e['ep_no']}-qism", callback_data=f"repep:{e['id']}")] for e in eps])
             await q.edit_message_text("Qaysi qism almashtirilsin?", reply_markup=kb)
         elif kind == "editdelep":
             if not is_owner(update):
@@ -931,7 +967,7 @@ def build_app():
             if not eps:
                 await q.edit_message_text("O'chiriladigan qism yo'q.")
                 return
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton(f"🗑 {e['ep_no']}-qism", callback_data=f"delep:{e['id']}")] for e in eps])
+            kb = InlineKeyboardMarkup([[_ibtn(f"🗑 {e['ep_no']}-qism", callback_data=f"delep:{e['id']}")] for e in eps])
             await q.edit_message_text("Qaysi qism o'chirilsin?", reply_markup=kb)
         elif kind == "editdelshort":
             if not is_owner(update):
@@ -940,7 +976,7 @@ def build_app():
             if not shorts:
                 await q.edit_message_text("O'chiriladigan short yo'q.")
                 return
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton(f"🗑 {s['title'] or s['id']}", callback_data=f"delshort:{s['id']}")] for s in shorts])
+            kb = InlineKeyboardMarkup([[_ibtn(f"🗑 {s['title'] or s['id']}", callback_data=f"delshort:{s['id']}")] for s in shorts])
             await q.edit_message_text("Qaysi short o'chirilsin?", reply_markup=kb)
         elif kind == "repep":
             if not is_owner(update):
@@ -1070,7 +1106,7 @@ def build_app():
             if not shorts:
                 await update.message.reply_text("Hozircha short yo'q.")
                 return
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton(f"📱 {s['title'] or 'Short'}", callback_data=f"short:{s['id']}")] for s in shorts])
+            kb = InlineKeyboardMarkup([[_ibtn(f"📱 {s['title'] or 'Short'}", callback_data=f"short:{s['id']}")] for s in shorts])
             await update.message.reply_text("🎞 Shortlar:", reply_markup=kb)
             return
         if is_owner(update) and text == BTN_ADD_ANIME:
