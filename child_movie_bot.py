@@ -117,7 +117,8 @@ def init_db():
         c.execute("CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT DEFAULT '')")
         for col, ddl in [("poster_file_id", "TEXT DEFAULT ''"), ("poster_msg_id", "INTEGER DEFAULT 0"),
                          ("storage_msg_id", "INTEGER DEFAULT 0"), ("is_premium", "INTEGER DEFAULT 0"),
-                         ("views", "INTEGER DEFAULT 0")]:
+                         ("views", "INTEGER DEFAULT 0"), ("genre", "TEXT DEFAULT ''"),
+                         ("recommended", "INTEGER DEFAULT 0")]:
             _ensure_col(c, "movies", col, ddl)
 
 
@@ -247,24 +248,45 @@ def top_movies(limit: int = 10):
         return c.execute("SELECT * FROM movies ORDER BY views DESC, id DESC LIMIT ?", (limit,)).fetchall()
 
 
+def premium_movies():
+    with conn() as c:
+        return c.execute("SELECT * FROM movies WHERE is_premium=1 ORDER BY id DESC").fetchall()
+
+
+def recommended_movies():
+    with conn() as c:
+        return c.execute("SELECT * FROM movies WHERE recommended=1 ORDER BY id DESC").fetchall()
+
+
+GENRES = ["Jangari", "Romantika", "Komediya", "Fantastika", "Drama", "Sarguzasht"]
+
+
+def genre_movies(genre: str):
+    with conn() as c:
+        return c.execute(
+            "SELECT * FROM movies WHERE genre=? OR title LIKE ? ORDER BY id DESC",
+            (genre, f"%{genre}%"),
+        ).fetchall()
+
+
 def get_movie(movie_id: int):
     with conn() as c:
         return c.execute("SELECT * FROM movies WHERE id=?", (movie_id,)).fetchone()
 
 
 def add_movie(title: str, file_id: str, poster_file_id: str = "", poster_msg_id: int = 0,
-              storage_msg_id: int = 0, is_premium: int = 0) -> int:
+              storage_msg_id: int = 0, is_premium: int = 0, genre: str = "", recommended: int = 0) -> int:
     with conn() as c:
         cur = c.execute(
-            "INSERT INTO movies(title, file_id, poster_file_id, poster_msg_id, storage_msg_id, is_premium) "
-            "VALUES(?,?,?,?,?,?)",
-            (title.strip(), file_id, poster_file_id or "", int(poster_msg_id), int(storage_msg_id), int(is_premium)),
+            "INSERT INTO movies(title, file_id, poster_file_id, poster_msg_id, storage_msg_id, is_premium, genre, recommended) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            (title.strip(), file_id, poster_file_id or "", int(poster_msg_id), int(storage_msg_id), int(is_premium), genre or "", int(recommended)),
         )
         return cur.lastrowid
 
 
 def update_movie(movie_id: int, title=None, file_id=None, poster_file_id=None, poster_msg_id=None,
-                 storage_msg_id=None, is_premium=None):
+                 storage_msg_id=None, is_premium=None, genre=None, recommended=None):
     with conn() as c:
         if title is not None:
             c.execute("UPDATE movies SET title=? WHERE id=?", (title.strip(), movie_id))
@@ -278,6 +300,10 @@ def update_movie(movie_id: int, title=None, file_id=None, poster_file_id=None, p
             c.execute("UPDATE movies SET storage_msg_id=? WHERE id=?", (int(storage_msg_id), movie_id))
         if is_premium is not None:
             c.execute("UPDATE movies SET is_premium=? WHERE id=?", (int(is_premium), movie_id))
+        if genre is not None:
+            c.execute("UPDATE movies SET genre=? WHERE id=?", (genre.strip(), movie_id))
+        if recommended is not None:
+            c.execute("UPDATE movies SET recommended=? WHERE id=?", (int(recommended), movie_id))
 
 
 def delete_movie(movie_id: int):
@@ -342,12 +368,17 @@ def build_app():
 
     if PANEL_STYLE == "minimal":
         BTN_LIST, BTN_NEW, BTN_TOP, BTN_TRAILERS = "Kinolar ro'yxati", "Yangilar", "Mashhur", "Treylerlar"
+        BTN_GENRES, BTN_REC, BTN_PREM, BTN_SEARCH = "Janrlar", "Tavsiya etilganlar", "Premium kinolar", "Qidiruv"
         BTN_ADD, BTN_ADD_TR, BTN_ADMIN = "Kino qo'shish", "Treyler qo'shish", "Admin panel"
     else:
         BTN_LIST = "🎬 Kinolar ro'yxati"
         BTN_NEW = "🆕 Yangilar"
         BTN_TOP = "🔥 Mashhur"
         BTN_TRAILERS = "🎬 Treylerlar"
+        BTN_GENRES = "🎭 Janrlar"
+        BTN_REC = "💎 Tavsiya etilganlar"
+        BTN_PREM = "👑 Premium kinolar"
+        BTN_SEARCH = "🔍 Qidiruv"
         BTN_ADD = "➕ Kino qo'shish"
         BTN_ADD_TR = "🎬 Treyler qo'shish"
         BTN_ADMIN = "🛡 Admin panel"
@@ -397,15 +428,12 @@ def build_app():
         return InlineKeyboardButton(text, callback_data=cb, style=style)
 
     def menu_for(update):
+        user_rows = [[BTN_LIST, BTN_NEW], [BTN_TOP, BTN_TRAILERS] if "shorts" in FEATURES else [BTN_TOP],
+                     [BTN_GENRES, BTN_REC], [BTN_PREM, BTN_SEARCH]]
         if is_owner(update):
-            # Foydalanuvchi paneli alohida: asosiy menyuda faqat foydalanuvchi
-            # tugmalari + bitta "Admin panel" kirish tugmasi. Qo'shish
-            # tugmalari faqat Admin panel ichida ko'rinadi.
-            rows = [[BTN_LIST, BTN_NEW], [BTN_TOP, BTN_TRAILERS] if "shorts" in FEATURES else [BTN_TOP],
-                    [BTN_ADMIN]]
+            rows = user_rows + [[BTN_ADMIN]]
             return ReplyKeyboardMarkup(_wrap_reply(rows), resize_keyboard=True)
-        rows = [[BTN_LIST, BTN_NEW], [BTN_TOP, BTN_TRAILERS] if "shorts" in FEATURES else [BTN_TOP]]
-        return ReplyKeyboardMarkup(_wrap_reply(rows), resize_keyboard=True)
+        return ReplyKeyboardMarkup(_wrap_reply(user_rows), resize_keyboard=True)
 
     def admin_keyboard():
         rows = [
@@ -754,7 +782,15 @@ def build_app():
             await send_movie_list(update, context)
             return
         kind, _, raw = data.partition(":")
-        if kind == "movie":
+        if kind == "genre":
+            if not await check_subscription(update, context):
+                return
+            rows = genre_movies(raw)
+            if not rows:
+                await q.edit_message_text(f"🎭 {raw} janrida hali kino yo'q.")
+                return
+            await q.message.reply_text(f"🎭 {raw} kinolar:", reply_markup=movies_keyboard(rows))
+        elif kind == "movie":
             try:
                 mid = int(raw)
             except ValueError:
@@ -824,6 +860,8 @@ def build_app():
             kb = InlineKeyboardMarkup([
                 [_ibtn("✏️ Nomini o'zgartirish", callback_data=f"edittitle:{mid}"),
                  _ibtn("🖼 Poster almashtirish", callback_data=f"editposter:{mid}")],
+                [_ibtn("🎭 Janr belgilash", callback_data=f"editgenre:{mid}"),
+                 _ibtn("💎 Tavsiya: " + ("O'chirish" if movie["recommended"] else "Yoqish"), callback_data=f"editrec:{mid}")],
                 [_ibtn("🎬 Video almashtirish", callback_data=f"editvideo:{mid}"),
                  _ibtn("⭐ Premium: " + ("O'chirish" if movie["is_premium"] else "Yoqish"), callback_data=f"editprem:{mid}")],
                 [_ibtn("🎬 Treyler o'chirish", callback_data=f"editdeltrailer:{mid}")],
@@ -848,6 +886,21 @@ def build_app():
             context.user_data["await"] = "edit_video"
             context.user_data["edit_id"] = int(raw)
             await q.message.reply_text("🎬 Yangi video yuboring (eski video o'rniga qo'yiladi):")
+        elif kind == "editgenre":
+            if not is_owner(update):
+                return
+            context.user_data["await"] = "edit_genre"
+            context.user_data["edit_id"] = int(raw)
+            await q.message.reply_text("🎭 Janrni yozing (masalan: Jangari). O'chirish uchun '-' yozing:")
+        elif kind == "editrec":
+            if not is_owner(update):
+                return
+            mid = int(raw)
+            movie = get_movie(mid)
+            if movie:
+                update_movie(mid, recommended=0 if movie["recommended"] else 1)
+                rec_word = "o'chirildi" if movie["recommended"] else "yoqildi"
+                await q.edit_message_text(f"💎 Tavsiya {rec_word}: {movie['title']}")
         elif kind == "editprem":
             if not is_owner(update):
                 return
@@ -987,6 +1040,60 @@ def build_app():
             kb = InlineKeyboardMarkup([[_ibtn(f"🎬 {t['title'] or 'Treyler'}", callback_data=f"trailer:{t['id']}")] for t in trs])
             await update.message.reply_text("🎬 Treylerlar:", reply_markup=kb)
             return
+        if text == BTN_GENRES:
+            context.user_data.pop("await", None)
+            if not await check_subscription(update, context):
+                return
+            kb = InlineKeyboardMarkup([[_ibtn(f"🎭 {g}", callback_data=f"genre:{g}")] for g in GENRES])
+            await update.message.reply_text("🎭 Janrni tanlang:", reply_markup=kb)
+            return
+        if text == BTN_REC:
+            context.user_data.pop("await", None)
+            if not await check_subscription(update, context):
+                return
+            rows = recommended_movies()
+            if not rows:
+                await update.message.reply_text("Hozircha tavsiya etilgan kino yo'q.")
+                return
+            await update.message.reply_text("💎 Tavsiya etilgan kinolar:", reply_markup=movies_keyboard(rows))
+            return
+        if text == BTN_PREM:
+            context.user_data.pop("await", None)
+            if not await check_subscription(update, context):
+                return
+            rows = premium_movies()
+            if not rows:
+                await update.message.reply_text("Hozircha premium kino yo'q.")
+                return
+            await update.message.reply_text("👑 Premium kinolar:", reply_markup=movies_keyboard(rows))
+            return
+        if text == BTN_SEARCH:
+            context.user_data.pop("await", None)
+            if not await check_subscription(update, context):
+                return
+            context.user_data["await"] = "search"
+            await update.message.reply_text("🔍 Kino nomini yoki kodini yozing:")
+            return
+        if state == "search":
+            context.user_data.pop("await", None)
+            if not await check_subscription(update, context):
+                return
+            if text.isdigit():
+                movie = get_movie(int(text))
+                if movie:
+                    await show_movie(update, context, int(text))
+                    return
+                await update.message.reply_text("Bu kodda kino topilmadi.")
+                return
+            await send_movie_list(update, context, query=text)
+            return
+        if is_owner(update) and state == "edit_genre":
+            mid = context.user_data.pop("edit_id", None)
+            context.user_data.pop("await", None)
+            if mid:
+                update_movie(mid, genre=text if text.strip() != "-" else "")
+                await update.message.reply_text(f"✅ Janr belgilandi: {text}")
+            return
         if is_owner(update) and text == BTN_ADD:
             context.user_data["await"] = "movie_title"
             await update.message.reply_text("Yangi kino nomini yozing:")
@@ -1095,7 +1202,7 @@ def build_app():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CallbackQueryHandler(on_admin_callback, pattern=r"^admin:"))
     app.add_handler(CallbackQueryHandler(on_delete_callback, pattern=r"^(delmovie|delchan|delpchan|deltrailer):"))
-    app.add_handler(CallbackQueryHandler(on_callback, pattern=r"^(movie|watch|trailer|traileradd|editmovie|edittitle|editposter|editvideo|editprem|editdeltrailer|postmovie|back):"))
+    app.add_handler(CallbackQueryHandler(on_callback, pattern=r"^(movie|watch|trailer|traileradd|editmovie|edittitle|editposter|editvideo|editprem|editgenre|editrec|editdeltrailer|postmovie|genre|back):"))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, handle_video))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))

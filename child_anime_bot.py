@@ -125,7 +125,8 @@ def init_db():
         c.execute("CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT DEFAULT '')")
         # Eski bazalar migratsiyasi (ma'lumot o'chmaydi):
         for col, ddl in [("poster_file_id", "TEXT DEFAULT ''"), ("poster_msg_id", "INTEGER DEFAULT 0"),
-                         ("is_premium", "INTEGER DEFAULT 0"), ("views", "INTEGER DEFAULT 0")]:
+                         ("is_premium", "INTEGER DEFAULT 0"), ("views", "INTEGER DEFAULT 0"),
+                         ("genre", "TEXT DEFAULT ''"), ("recommended", "INTEGER DEFAULT 0")]:
             _ensure_col(c, "animes", col, ddl)
         for col, ddl in [("storage_msg_id", "INTEGER DEFAULT 0"), ("views", "INTEGER DEFAULT 0")]:
             _ensure_col(c, "episodes", col, ddl)
@@ -259,6 +260,27 @@ def top_animes(limit: int = 10):
         return c.execute("SELECT * FROM animes ORDER BY views DESC, id DESC LIMIT ?", (limit,)).fetchall()
 
 
+def premium_animes():
+    with conn() as c:
+        return c.execute("SELECT * FROM animes WHERE is_premium=1 ORDER BY id DESC").fetchall()
+
+
+def recommended_animes():
+    with conn() as c:
+        return c.execute("SELECT * FROM animes WHERE recommended=1 ORDER BY id DESC").fetchall()
+
+
+GENRES = ["Jangari", "Romantika", "Komediya", "Fantastika", "Drama", "Sarguzasht"]
+
+
+def genre_animes(genre: str):
+    with conn() as c:
+        return c.execute(
+            "SELECT * FROM animes WHERE genre=? OR title LIKE ? ORDER BY id DESC",
+            (genre, f"%{genre}%"),
+        ).fetchall()
+
+
 def get_anime(anime_id: int):
     with conn() as c:
         return c.execute("SELECT * FROM animes WHERE id=?", (anime_id,)).fetchone()
@@ -281,16 +303,16 @@ def get_episode(ep_id: int):
         return c.execute("SELECT * FROM episodes WHERE id=?", (ep_id,)).fetchone()
 
 
-def add_anime(title: str, poster_file_id: str = "", is_premium: int = 0) -> int:
+def add_anime(title: str, poster_file_id: str = "", is_premium: int = 0, genre: str = "", recommended: int = 0) -> int:
     with conn() as c:
         cur = c.execute(
-            "INSERT INTO animes(title, poster_file_id, is_premium) VALUES(?,?,?)",
-            (title.strip(), poster_file_id or "", int(is_premium)),
+            "INSERT INTO animes(title, poster_file_id, is_premium, genre, recommended) VALUES(?,?,?,?,?)",
+            (title.strip(), poster_file_id or "", int(is_premium), genre or "", int(recommended)),
         )
         return cur.lastrowid
 
 
-def update_anime(anime_id: int, title=None, poster_file_id=None, poster_msg_id=None, is_premium=None):
+def update_anime(anime_id: int, title=None, poster_file_id=None, poster_msg_id=None, is_premium=None, genre=None, recommended=None):
     with conn() as c:
         if title is not None:
             c.execute("UPDATE animes SET title=? WHERE id=?", (title.strip(), anime_id))
@@ -300,6 +322,10 @@ def update_anime(anime_id: int, title=None, poster_file_id=None, poster_msg_id=N
             c.execute("UPDATE animes SET poster_msg_id=? WHERE id=?", (int(poster_msg_id), anime_id))
         if is_premium is not None:
             c.execute("UPDATE animes SET is_premium=? WHERE id=?", (int(is_premium), anime_id))
+        if genre is not None:
+            c.execute("UPDATE animes SET genre=? WHERE id=?", (genre.strip(), anime_id))
+        if recommended is not None:
+            c.execute("UPDATE animes SET recommended=? WHERE id=?", (int(recommended), anime_id))
 
 
 def delete_anime(anime_id: int):
@@ -396,6 +422,7 @@ def build_app():
 
     if PANEL_STYLE == "minimal":
         BTN_LIST, BTN_NEW, BTN_TOP, BTN_SHORTS = "Anime ro'yxati", "Yangilar", "Mashhur", "Shortlar"
+        BTN_GENRES, BTN_REC, BTN_PREM, BTN_SEARCH = "Janrlar", "Tavsiya etilganlar", "Premium animelar", "Qidiruv"
         BTN_ADD_ANIME, BTN_ADD_EP, BTN_ADD_SHORT = "Anime qo'shish", "Qism qo'shish", "Short qo'shish"
         BTN_ADMIN, BTN_BACK_MAIN = "Admin panel", "Asosiy menyu"
     else:
@@ -403,6 +430,10 @@ def build_app():
         BTN_NEW = "🆕 Yangilar"
         BTN_TOP = "🔥 Mashhur"
         BTN_SHORTS = "🎞 Shortlar"
+        BTN_GENRES = "🎭 Janrlar"
+        BTN_REC = "💎 Tavsiya etilganlar"
+        BTN_PREM = "👑 Premium animelar"
+        BTN_SEARCH = "🔍 Qidiruv"
         BTN_ADD_ANIME = "➕ Anime qo'shish"
         BTN_ADD_EP = "🎞 Qism qo'shish"
         BTN_ADD_SHORT = "📱 Short qo'shish"
@@ -454,15 +485,16 @@ def build_app():
         return InlineKeyboardButton(text, callback_data=cb, style=style)
 
     def menu_for(update):
+        # 8 ta foydalanuvchi bo'limi, hammaga bir xil:
+        user_rows = [[BTN_LIST, BTN_NEW], [BTN_TOP, BTN_SHORTS] if "shorts" in FEATURES else [BTN_TOP],
+                     [BTN_GENRES, BTN_REC], [BTN_PREM, BTN_SEARCH]]
         if is_owner(update):
-            # Foydalanuvchi paneli alohida: asosiy menyuda faqat foydalanuvchi
-            # tugmalari + bitta "Admin panel" kirish tugmasi. Qo'shish
+            # Foydalanuvchi paneli alohida: asosiy menyuda foydalanuvchi
+            # bo'limlari + bitta "Admin panel" kirish tugmasi. Qo'shish
             # tugmalari faqat Admin panel ichida ko'rinadi.
-            rows = [[BTN_LIST, BTN_NEW], [BTN_TOP, BTN_SHORTS] if "shorts" in FEATURES else [BTN_TOP],
-                    [BTN_ADMIN]]
+            rows = user_rows + [[BTN_ADMIN]]
             return ReplyKeyboardMarkup(_wrap_reply(rows), resize_keyboard=True)
-        rows = [[BTN_LIST, BTN_NEW], [BTN_TOP, BTN_SHORTS] if "shorts" in FEATURES else [BTN_TOP]]
-        return ReplyKeyboardMarkup(_wrap_reply(rows), resize_keyboard=True)
+        return ReplyKeyboardMarkup(_wrap_reply(user_rows), resize_keyboard=True)
 
     def admin_keyboard():
         rows = [
@@ -838,7 +870,15 @@ def build_app():
             await send_anime_list(update, context)
             return
         kind, _, raw = data.partition(":")
-        if kind == "anime":
+        if kind == "genre":
+            if not await check_subscription(update, context):
+                return
+            rows = genre_animes(raw)
+            if not rows:
+                await q.edit_message_text(f"🎭 {raw} janrida hali anime yo'q.")
+                return
+            await q.message.reply_text(f"🎭 {raw} animelar:", reply_markup=animes_keyboard(rows))
+        elif kind == "anime":
             try:
                 anime_id = int(raw)
             except ValueError:
@@ -923,6 +963,8 @@ def build_app():
             kb = InlineKeyboardMarkup([
                 [_ibtn("✏️ Nomini o'zgartirish", callback_data=f"edittitle:{anime_id}"),
                  _ibtn("🖼 Poster almashtirish", callback_data=f"editposter:{anime_id}")],
+                [_ibtn("🎭 Janr belgilash", callback_data=f"editgenre:{anime_id}"),
+                 _ibtn("💎 Tavsiya: " + ("O'chirish" if anime["recommended"] else "Yoqish"), callback_data=f"editrec:{anime_id}")],
                 [_ibtn("⭐ Premium: " + ("O'chirish" if anime["is_premium"] else "Yoqish"), callback_data=f"editprem:{anime_id}")],
                 [_ibtn("🎞 Qism almashtirish", callback_data=f"editrepep:{anime_id}"),
                  _ibtn("🗑 Qism o'chirish", callback_data=f"editdelep:{anime_id}")],
@@ -942,6 +984,21 @@ def build_app():
             context.user_data["await"] = "edit_poster"
             context.user_data["edit_id"] = int(raw)
             await q.message.reply_text("🖼 Yangi poster rasmini yuboring (rasm qilib):")
+        elif kind == "editgenre":
+            if not is_owner(update):
+                return
+            context.user_data["await"] = "edit_genre"
+            context.user_data["edit_id"] = int(raw)
+            await q.message.reply_text("🎭 Janrni yozing (masalan: Jangari). O'chirish uchun '-' yozing:")
+        elif kind == "editrec":
+            if not is_owner(update):
+                return
+            anime_id = int(raw)
+            anime = get_anime(anime_id)
+            if anime:
+                update_anime(anime_id, recommended=0 if anime["recommended"] else 1)
+                rec_word = "o'chirildi" if anime["recommended"] else "yoqildi"
+                await q.edit_message_text(f"💎 Tavsiya {rec_word}: {anime['title']}")
         elif kind == "editprem":
             if not is_owner(update):
                 return
@@ -1109,6 +1166,60 @@ def build_app():
             kb = InlineKeyboardMarkup([[_ibtn(f"📱 {s['title'] or 'Short'}", callback_data=f"short:{s['id']}")] for s in shorts])
             await update.message.reply_text("🎞 Shortlar:", reply_markup=kb)
             return
+        if text == BTN_GENRES:
+            context.user_data.pop("await", None)
+            if not await check_subscription(update, context):
+                return
+            kb = InlineKeyboardMarkup([[_ibtn(f"🎭 {g}", callback_data=f"genre:{g}")] for g in GENRES])
+            await update.message.reply_text("🎭 Janrni tanlang:", reply_markup=kb)
+            return
+        if text == BTN_REC:
+            context.user_data.pop("await", None)
+            if not await check_subscription(update, context):
+                return
+            rows = recommended_animes()
+            if not rows:
+                await update.message.reply_text("Hozircha tavsiya etilgan anime yo'q.")
+                return
+            await update.message.reply_text("💎 Tavsiya etilgan animelar:", reply_markup=animes_keyboard(rows))
+            return
+        if text == BTN_PREM:
+            context.user_data.pop("await", None)
+            if not await check_subscription(update, context):
+                return
+            rows = premium_animes()
+            if not rows:
+                await update.message.reply_text("Hozircha premium anime yo'q.")
+                return
+            await update.message.reply_text("👑 Premium animelar:", reply_markup=animes_keyboard(rows))
+            return
+        if text == BTN_SEARCH:
+            context.user_data.pop("await", None)
+            if not await check_subscription(update, context):
+                return
+            context.user_data["await"] = "search"
+            await update.message.reply_text("🔍 Anime nomini yoki kodini yozing:")
+            return
+        if state == "search":
+            context.user_data.pop("await", None)
+            if not await check_subscription(update, context):
+                return
+            if text.isdigit():
+                anime = get_anime(int(text))
+                if anime:
+                    await show_anime(update, context, int(text))
+                    return
+                await update.message.reply_text("Bu kodda anime topilmadi.")
+                return
+            await send_anime_list(update, context, query=text)
+            return
+        if is_owner(update) and state == "edit_genre":
+            aid = context.user_data.pop("edit_id", None)
+            context.user_data.pop("await", None)
+            if aid:
+                update_anime(aid, genre=text if text.strip() != "-" else "")
+                await update.message.reply_text(f"✅ Janr belgilandi: {text}")
+            return
         if is_owner(update) and text == BTN_ADD_ANIME:
             context.user_data["await"] = "anime_title"
             await update.message.reply_text("Yangi anime nomini yozing:")
@@ -1227,7 +1338,7 @@ def build_app():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CallbackQueryHandler(on_admin_callback, pattern=r"^admin:"))
     app.add_handler(CallbackQueryHandler(on_delete_callback, pattern=r"^(delanime|delchan|delpchan|delshort|delep):"))
-    app.add_handler(CallbackQueryHandler(on_callback, pattern=r"^(anime|ep|epadd|short|shortadd|editanime|edittitle|editposter|editprem|editrepep|editdelep|editdelshort|repep|postanime|back):"))
+    app.add_handler(CallbackQueryHandler(on_callback, pattern=r"^(anime|ep|epadd|short|shortadd|editanime|edittitle|editposter|editprem|editgenre|editrec|editrepep|editdelep|editdelshort|repep|postanime|genre|back):"))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, handle_video))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
