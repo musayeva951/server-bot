@@ -91,13 +91,15 @@ MAX_ZIP_EXTRACTED = 10 * 1024 * 1024  # zip ochilgandagi umumiy limit
 
 CHILD_SCRIPT = BASE_DIR / "child_anime_bot.py"
 CHILD_MOVIE_SCRIPT = BASE_DIR / "child_movie_bot.py"
+CHILD_GENERAL_SCRIPT = BASE_DIR / "child_general_bot.py"
 # Bot turi -> ishga tushadigan shablon fayli va foydalanuvchiga
 # yuboriladigan fayl (bot-maker "fayllarni tashlab beradi" sharti).
 TEMPLATE_FILES = {
     "anime": CHILD_SCRIPT,
     "movie": CHILD_MOVIE_SCRIPT,
+    "general": CHILD_GENERAL_SCRIPT,
 }
-TEMPLATE_NAMES = {"anime": "Anime bot", "movie": "Kino bot"}
+TEMPLATE_NAMES = {"anime": "Anime bot", "movie": "Kino bot", "general": "Umumiy bot"}
 # Bot yaratish so'rovnomasi: foydalanuvchi qaysi funksiyalar qo'shilishini
 # tanlaydi, keyin panel uslubini tanlaydi. Tanlov bots jadvalida saqlanadi
 # va bola botga env orqali beriladi (CHILD_FEATURES, PANEL_STYLE).
@@ -1353,10 +1355,12 @@ def build_app():
         "tokenni yuboring. Shu token bilan tayyor shablon nusxasi ishga tushadi, "
         "o'z katalogingiz, alohida baza — va shablon fayli ham sizga yuboriladi.\n\n"
         "*Anime bot:* anime ro'yxati, qidiruv, qismlar, video tomosha.\n"
-        "*Kino bot:* kinolar ro'yxati, qidiruv, bitta film — bitta video.\n\n"
+        "*Kino bot:* kinolar ro'yxati, qidiruv, bitta film — bitta video.\n"
+        "*Umumiy bot:* egasi bo'limlar va kontentni (matn, rasm, video) o'zi "
+        "to'ldiradi, majburiy obuna + premium + admin panel tayyor.\n\n"
         "*2-usul — kod:* «📁 Bot qo'shish (kod)» ni bosib, botingiz kodini (.py fayl yoki ichida "
         "bot.py/main.py bor .zip) tashlang, keyin shu kod uchun bot tokenini yuboring. Token getMe bilan "
-        "tekshirilib, shifrlab saqlanadi va ishga tushirishda BOT_TOKEN env orqali kodga beriladi. "
+        "tekshirilib, shifrlab saqlanadi va ishga tushirishda `BOT_TOKEN` env orqali kodga beriladi. "
         "Kod o'z papkasida alohida jarayon bo'lib ishlaydi.\n\n"
         f"*💰 Hamyon:* «💰 Hamyonim» dan balans to'ldiring (Stars — 1 ⭐ = 300 so'm, karta — chek tasdiqlangach). "
         "Oylik muddati tugaganda, balansda pul bo'lsa, oylik avtomatik yechilib uzayadi.\n\n"
@@ -1381,7 +1385,7 @@ def build_app():
             credit_line = f"\n💎 Premium kreditingiz: {credits} ta bot."
         await update.message.reply_text(
             "Assalomu alaykum! 👋 Bu — bot-maker + server bot.\n"
-            "Token bering, bot turini ayting — anime botmi, kino botmi — "
+            "Token bering, bot turini ayting — anime, kino yoki umumiy botmi — "
             "shunaqa bot yasab, shu serverga ulab beraman, faylini ham tashlab beraman.\n"
             f"💰 1 ta bot: {PRICE_SOM:,} so'm / {PRICE_STARS} ⭐."
             + credit_line,
@@ -1389,7 +1393,19 @@ def build_app():
         )
 
     async def show_help(update, context):
-        await update.message.reply_text(HELP_TEXT, parse_mode="Markdown")
+        # Markdown xatosi bo'lsa ham Yordam matni yetib borsin: avval
+        # Markdown bilan, xato bo'lsa oddiy matn bilan qayta yuboriladi.
+        # Yordam bosilganda kutish holati (token/karta/elon kutilayotgani)
+        # tozalanadi — aks holda keyingi xabar noto'g'ri joyga tushadi.
+        context.user_data.pop("await", None)
+        try:
+            await update.message.reply_text(
+                HELP_TEXT, parse_mode="Markdown", reply_markup=main_menu(update.effective_user.id)
+            )
+        except Exception:
+            await update.message.reply_text(
+                HELP_TEXT, reply_markup=main_menu(update.effective_user.id)
+            )
 
     # ---------- mening botlarim ----------
 
@@ -1931,14 +1947,17 @@ def build_app():
         if count_bots_total() >= MAX_BOTS:
             await update.message.reply_text("Server to'lgan (tekin server kuchsiz, umumiy limit bor). Keyinroq urinib ko'ring.")
             return
-        kb = InlineKeyboardMarkup([[
-            _ibtn("🎬 Anime bot", callback_data="make:anime"),
-            _ibtn("🎞 Kino bot", callback_data="make:movie"),
-        ]])
+        kb = InlineKeyboardMarkup([
+            [_ibtn("🎬 Anime bot", callback_data="make:anime"),
+             _ibtn("🎞 Kino bot", callback_data="make:movie")],
+            [_ibtn("🧩 Umumiy bot", callback_data="make:general")],
+        ])
         await update.message.reply_text(
             "Qanaqa bot yasash kerak?\n"
             "🎬 Anime bot — Uzbek_animelar_olami ga o'xshagan: anime ro'yxati, qismlar.\n"
-            "🎞 Kino bot — kinolar ro'yxati, har bir film bitta video.",
+            "🎞 Kino bot — kinolar ro'yxati, har bir film bitta video.\n"
+            "🧩 Umumiy bot — har qanaqa bot: egasi bo'limlar va kontentni "
+            "(matn, rasm, video) o'zi to'ldiradi, majburiy obuna + premium tayyor.",
             reply_markup=kb,
         )
 
@@ -2304,7 +2323,7 @@ def build_app():
         )
         bot_work_dir(bot_id).mkdir(parents=True, exist_ok=True)
         ok, msg = start_bot(bot_id)
-        add_text = "anime va qism" if bot_type == "anime" else "kino"
+        add_text = {"anime": "anime va qism", "movie": "kino", "general": "kontent"}.get(bot_type, "kontent")
         await update.effective_chat.send_message(
             f"✅ {TEMPLATE_NAMES[bot_type]} qo'shildi: @{me.username}\nHolat: {msg}\n"
             f"Endi o'sha botga kiring: egasi sifatida siz {add_text} qo'sha olasiz.\n"
