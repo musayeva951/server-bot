@@ -72,6 +72,7 @@ PRICE_STARS = int(os.environ.get("PRICE_STARS", "200") or 200)
 MAX_BOTS = int(os.environ.get("MAX_BOTS", "5") or 5)
 MAX_BOTS_PER_USER = int(os.environ.get("MAX_BOTS_PER_USER", "3") or 3)
 MAX_CODE_SIZE = int(os.environ.get("MAX_CODE_SIZE", str(2 * 1024 * 1024)) or 2 * 1024 * 1024)
+MAX_DB_SIZE = int(os.environ.get("MAX_DB_SIZE", str(20 * 1024 * 1024)) or 20 * 1024 * 1024)
 MAX_ZIP_EXTRACTED = 10 * 1024 * 1024  # zip ochilgandagi umumiy limit
 
 CHILD_SCRIPT = BASE_DIR / "child_anime_bot.py"
@@ -610,6 +611,24 @@ def check_python_syntax(file_path: Path) -> tuple[bool, str]:
         return True, ""
     except Exception as e:
         return False, str(e)[:500]
+
+
+def validate_anime_db(file_path: Path) -> tuple[bool, str]:
+    """Kod boti bazasini tekshirish: SQLite bo'lishi va animelar +
+    serial_qismlar jadvallari bo'lishi kerak. Muvaffaqiyatda anime soni qaytadi."""
+    try:
+        con = sqlite3.connect(str(file_path), timeout=10)
+        try:
+            tables = {r[0] for r in con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
+            if "animelar" not in tables or "serial_qismlar" not in tables:
+                return False, "animelar yoki serial_qismlar jadvali topilmadi"
+            n = con.execute("SELECT COUNT(*) FROM animelar").fetchone()[0]
+            return True, f"{n} ta anime"
+        finally:
+            con.close()
+    except Exception as e:
+        return False, str(e)[:300]
 
 
 # ---------------------------------------------------------------- telegram qismi
@@ -1196,6 +1215,7 @@ def build_app():
         # Kod boti: yangi kodni baza o'chmasdan almashtirish.
         if kind == "code":
             rows.append([_ibtn("🔄 Kod yangilash", callback_data=f"act:codeupdate:{bot_id}")])
+            rows.append([_ibtn("📦 Baza yuklash", callback_data=f"act:dbupdate:{bot_id}")])
         return InlineKeyboardMarkup(rows)
 
     async def my_bots(update, context):
@@ -1240,6 +1260,19 @@ def build_app():
                 f"Bot #{bot_id} uchun yangi .py faylni yuboring.\n"
                 "Baza o'chmaydi — faqat kod fayli almashtiriladi, keyin bot qayta ishga tushadi. "
                 "Avval sintaksis tekshiriladi: xato bo'lsa eski kod ishlashda davom etadi."
+            )
+            return
+        if action == "dbupdate":
+            if row["kind"] != "code":
+                await q.edit_message_text(f"Bot #{bot_id}: baza yuklash faqat kod usulidagi botlar uchun.")
+                return
+            context.user_data["await"] = "db_update"
+            context.user_data["code_bot_id"] = bot_id
+            await q.message.reply_text(
+                f"Bot #{bot_id} uchun baza .db faylini yuboring (masalan, animed_backup_....db).\n"
+                "Bot avval to'xtatiladi, eski baza zaxiraga olinadi, yangi baza tekshiriladi: "
+                "SQLite bo'lishi va animelar + serial_qismlar jadvallari bo'lishi kerak. "
+                "Tekshiruvdan o'tmasa eski baza qaytariladi. O'tsa bot yangi baza bilan qayta ishga tushadi."
             )
             return
         if action == "codetoken":
@@ -1751,6 +1784,65 @@ def build_app():
             start_bot(bot_id)
             await update.message.reply_text(f"Yangi kod ishga tushmadi, eski kod qaytarildi: {msg}")
 
+    async def handle_db_update_doc(update, context):
+        """Kod boti bazasini yuklash: faqat .db, tekshiruvdan o'tsa almashtirish."""
+        doc = update.message.document
+        if doc is None:
+            return
+        bot_id = context.user_data.get("code_bot_id")
+        row = get_bot(bot_id) if bot_id else None
+        if row is None or row["owner_id"] != update.effective_user.id or row["kind"] != "code":
+            await update.message.reply_text("Bot topilmadi yoki sizniki emas.")
+            return
+        name = doc.file_name or ""
+        if Path(name).suffix.lower() not in (".db", ".sqlite", ".sqlite3"):
+            await update.message.reply_text("Baza uchun faqat .db fayl yuboring.")
+            return
+        if doc.file_size and doc.file_size > MAX_DB_SIZE:
+            await update.message.reply_text("Baza fayli juda katta — limit 20 MB.")
+            return
+        code_dir = Path(row["code_dir"])
+        # Kod boti bazasi code_dir dagi uz.dubanime_v1.db — shu faylni ham
+        # botning o'zi, ham server bot sayt API si o'qiydi.
+        target = code_dir / "uz.dubanime_v1.db"
+        work = bot_work_dir(bot_id)
+        work.mkdir(parents=True, exist_ok=True)
+        tmp_path = work / "db_update_tmp.db"
+        try:
+            tg_file = await doc.get_file()
+            await tg_file.download_to_drive(str(tmp_path))
+        except Exception as e:
+            await update.message.reply_text(f"Faylni yuklab bo'lmadi: {e}")
+            return
+        ok, info = validate_anime_db(tmp_path)
+        if not ok:
+            tmp_path.unlink(missing_ok=True)
+            await update.message.reply_text(
+                f"Baza tekshiruvdan o'tmadi, almashtirilmadi — eski baza ishlashda davom etadi:\n{info}"
+            )
+            return
+        stop_bot(bot_id)
+        backup = work / "db_backup.db"
+        if target.exists():
+            shutil.copyfile(target, backup)
+        try:
+            shutil.move(str(tmp_path), str(target))
+        except Exception as e:
+            tmp_path.unlink(missing_ok=True)
+            await update.message.reply_text(f"Bazani joylab bo'lmadi: {e}")
+            return
+        context.user_data.pop("await", None)
+        ok, msg = start_bot(bot_id)
+        if ok:
+            await update.message.reply_text(
+                f"✅ Bot #{bot_id} bazasi yuklandi ({info}), bot qayta ishga tushdi.")
+        else:
+            if backup.exists():
+                shutil.copyfile(backup, target)
+            start_bot(bot_id)
+            await update.message.reply_text(
+                f"Bot yangi baza bilan ishga tushmadi, eski baza qaytarildi: {msg}")
+
     async def handle_code_token(update, context, token_text: str):
         from telegram import Bot
         from telegram.error import InvalidToken, NetworkError, TelegramError, TimedOut
@@ -1860,6 +1952,9 @@ def build_app():
         if context.user_data.get("await") == "code_update":
             await update.message.reply_text("Kod yangilanishi kutyapman — yangi .py fayl tashlang (matn emas).")
             return
+        if context.user_data.get("await") == "db_update":
+            await update.message.reply_text("Baza yuklanishi kutyapman — .db fayl tashlang (matn emas).")
+            return
         await update.message.reply_text("Menyudan tanlang 👇", reply_markup=main_menu(update.effective_user.id))
 
     async def handle_doc(update, context):
@@ -1867,6 +1962,8 @@ def build_app():
             return await handle_code_doc(update, context)
         if context.user_data.get("await") == "code_update":
             return await handle_code_update_doc(update, context)
+        if context.user_data.get("await") == "db_update":
+            return await handle_db_update_doc(update, context)
         await update.message.reply_text("Avval «📁 Bot qo'shish (kod)» tugmasini bosing, keyin fayl tashlang.")
 
     async def post_init(app):
