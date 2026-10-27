@@ -92,6 +92,10 @@ MAX_ZIP_EXTRACTED = 10 * 1024 * 1024  # zip ochilgandagi umumiy limit
 CHILD_SCRIPT = BASE_DIR / "child_anime_bot.py"
 CHILD_MOVIE_SCRIPT = BASE_DIR / "child_movie_bot.py"
 CHILD_GENERAL_SCRIPT = BASE_DIR / "child_general_bot.py"
+CHILD_USERBOT_SCRIPT = BASE_DIR / "child_userbot.py"
+# Userbotlar uchun alohida bo'lim limiti (Telethon og'ir, RAM cheklangan):
+MAX_USERBOTS_PER_USER = 1
+MAX_USERBOTS_TOTAL = 3
 # Bot turi -> ishga tushadigan shablon fayli va foydalanuvchiga
 # yuboriladigan fayl (bot-maker "fayllarni tashlab beradi" sharti).
 TEMPLATE_FILES = {
@@ -285,6 +289,19 @@ def init_db():
                    status TEXT NOT NULL DEFAULT 'paid',
                    created_at TEXT NOT NULL)"""
         )
+        # ALOHIDA BO'LIM — userbotlar (Bot API botlaridan alohida jadval).
+        # Sessiya stringi hisob kalitiga teng, shuning uchun shifrlab saqlanadi.
+        c.execute(
+            """CREATE TABLE IF NOT EXISTS userbots(
+                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   owner_id INTEGER NOT NULL,
+                   api_id_enc TEXT DEFAULT '',
+                   api_hash_enc TEXT DEFAULT '',
+                   session_enc TEXT DEFAULT '',
+                   session_hash TEXT DEFAULT '',
+                   status TEXT NOT NULL DEFAULT 'stopped',
+                   created_at TEXT NOT NULL)"""
+        )
 
 
 def add_user(user_id: int, username: str = ""):
@@ -368,6 +385,52 @@ def get_all_bots():
 def delete_bot_row(bot_id: int):
     with db_conn() as c:
         c.execute("DELETE FROM bots WHERE id=?", (bot_id,))
+
+
+# ---------------------------------------------------------------- userbotlar (alohida bo'lim)
+
+def count_userbots_total() -> int:
+    with db_conn() as c:
+        return c.execute("SELECT COUNT(*) FROM userbots").fetchone()[0]
+
+
+def count_userbots_user(owner_id: int) -> int:
+    with db_conn() as c:
+        return c.execute("SELECT COUNT(*) FROM userbots WHERE owner_id=?", (owner_id,)).fetchone()[0]
+
+
+def create_userbot(owner_id: int, api_id_enc: str, api_hash_enc: str, session_enc: str, session_hash: str) -> int:
+    with db_conn() as c:
+        cur = c.execute(
+            """INSERT INTO userbots(owner_id, api_id_enc, api_hash_enc, session_enc, session_hash, status, created_at)
+               VALUES(?,?,?,?,?,'stopped',?)""",
+            (owner_id, api_id_enc, api_hash_enc, session_enc, session_hash,
+             datetime.now().isoformat(timespec="seconds")),
+        )
+        return cur.lastrowid
+
+
+def get_userbot(ub_id: int):
+    with db_conn() as c:
+        return c.execute("SELECT * FROM userbots WHERE id=?", (ub_id,)).fetchone()
+
+
+def get_user_userbots(owner_id: int):
+    with db_conn() as c:
+        return c.execute("SELECT * FROM userbots WHERE owner_id=? ORDER BY id", (owner_id,)).fetchall()
+
+
+def update_userbot(ub_id: int, **fields):
+    if not fields:
+        return
+    cols = ", ".join(f"{k}=?" for k in fields)
+    with db_conn() as c:
+        c.execute(f"UPDATE userbots SET {cols} WHERE id=?", (*fields.values(), ub_id))
+
+
+def delete_userbot_row(ub_id: int):
+    with db_conn() as c:
+        c.execute("DELETE FROM userbots WHERE id=?", (ub_id,))
 
 
 # ---------------------------------------------------------------- oylik to'lov
@@ -570,6 +633,100 @@ def count_premium_users() -> int:
 # ---------------------------------------------------------------- jarayon boshqaruvi
 
 _processes: dict[int, subprocess.Popen] = {}
+_userbot_processes: dict[int, subprocess.Popen] = {}
+
+
+def userbot_work_dir(ub_id: int) -> Path:
+    return DATA_DIR / "userbots" / str(ub_id)
+
+
+def userbot_log_path(ub_id: int) -> Path:
+    return userbot_work_dir(ub_id) / "userbot.log"
+
+
+def is_userbot_running(ub_id: int) -> bool:
+    p = _userbot_processes.get(ub_id)
+    return p is not None and p.poll() is None
+
+
+def sync_userbot_status(ub_id: int):
+    row = get_userbot(ub_id)
+    if row and row["status"] == "running" and not is_userbot_running(ub_id):
+        update_userbot(ub_id, status="stopped")
+
+
+def start_userbot(ub_id: int) -> tuple[bool, str]:
+    row = get_userbot(ub_id)
+    if row is None:
+        return False, "Userbot topilmadi"
+    if is_userbot_running(ub_id):
+        return True, "Allaqachon ishlayapti"
+    if not CHILD_USERBOT_SCRIPT.exists():
+        return False, "child_userbot.py topilmadi — deployda shu fayl ham bo'lishi kerak"
+    try:
+        api_id = decrypt_token(row["api_id_enc"])
+        api_hash = decrypt_token(row["api_hash_enc"])
+        session = decrypt_token(row["session_enc"])
+    except Exception as e:
+        return False, f"Ma'lumotlarni ochib bo'lmadi: {e}"
+    if not api_id or not api_hash or not session:
+        return False, "API_ID / API_HASH / sessiya to'liq emas"
+    work = userbot_work_dir(ub_id)
+    work.mkdir(parents=True, exist_ok=True)
+    env = _clean_env({
+        "USERBOT_API_ID": api_id,
+        "USERBOT_API_HASH": api_hash,
+        "USERBOT_SESSION": session,
+        "OWNER_ID": str(row["owner_id"]),
+        "USERBOT_DB_PATH": str(work / "userbot.db"),
+        "USERBOT_PRODUCTS_FILE": str(work / "products.json"),
+    })
+    # products.json bo'lmasa bo'sh ro'yxat bilan yaratiladi (savdo keyin to'ldiriladi)
+    prod = work / "products.json"
+    if not prod.exists():
+        prod.write_text("[]", encoding="utf-8")
+    log_file = open(userbot_log_path(ub_id), "ab")
+    try:
+        p = subprocess.Popen(
+            [sys.executable, str(CHILD_USERBOT_SCRIPT)],
+            cwd=str(work), env=env,
+            stdout=log_file, stderr=subprocess.STDOUT,
+            start_new_session=True,
+            preexec_fn=_preexec_limits if os.name == "posix" else None,
+        )
+    except Exception as e:
+        log_file.close()
+        return False, f"Ishga tushmadi: {e}"
+    _userbot_processes[ub_id] = p
+    update_userbot(ub_id, status="running")
+    log.info("Userbot #%s ishga tushdi (pid=%s)", ub_id, p.pid)
+    return True, "Ishga tushdi ✅"
+
+
+def stop_userbot(ub_id: int) -> tuple[bool, str]:
+    p = _userbot_processes.get(ub_id)
+    if p is not None and p.poll() is None:
+        try:
+            p.terminate()
+            p.wait(timeout=10)
+        except Exception:
+            try:
+                p.kill()
+            except Exception:
+                pass
+    _userbot_processes.pop(ub_id, None)
+    update_userbot(ub_id, status="stopped")
+    return True, "To'xtatildi"
+
+
+def restore_running_userbots():
+    with db_conn() as c:
+        rows = c.execute("SELECT id FROM userbots WHERE status='running'").fetchall()
+    for r in rows:
+        ok, msg = start_userbot(int(r[0]))
+        if not ok:
+            update_userbot(int(r[0]), status="stopped")
+            log.warning("Userbot #%s qayta yoqilmadi: %s", r[0], msg)
 
 
 def bot_work_dir(bot_id: int) -> Path:
@@ -1306,6 +1463,7 @@ def build_app():
     BTN_TOKEN = "➕ Bot yasash (token)"
     BTN_CODE = "📁 Bot qo'shish (kod)"
     BTN_MY = "🤖 Mening botlarim"
+    BTN_USERBOTS = "👤 Userbotlar"
     BTN_HELP = "ℹ️ Yordam"
     BTN_PREMIUM = "💎 Premium olish"
     BTN_WALLET = "💰 Hamyonim"
@@ -1336,7 +1494,7 @@ def build_app():
         return InlineKeyboardButton(text, callback_data=callback_data, style=style)
 
     def main_menu(user_id: int = 0):
-        rows = [[BTN_TOKEN, BTN_CODE], [BTN_MY, BTN_PREMIUM], [BTN_WALLET, BTN_HELP]]
+        rows = [[BTN_TOKEN, BTN_CODE], [BTN_MY, BTN_USERBOTS], [BTN_PREMIUM, BTN_WALLET], [BTN_HELP]]
         if user_id and is_super_admin(user_id):
             rows.append([BTN_ADMIN])
         return ReplyKeyboardMarkup(_colored(rows), resize_keyboard=True)
@@ -1368,6 +1526,12 @@ def build_app():
         "Yangi botning birinchi oyi yaratish narxiga kiradi. Muddat tugasa bot ishga tushmaydi — "
         "«🤖 Mening botlarim» → «💳 Oylik to'lash» dan to'lang: Stars avtomatik uzaytiradi, "
         "karta to'lovida chek yuborasiz, super admin tasdiqlasa uzayadi.\n\n"
+        "*👤 Userbotlar — ALOHIDA BO'LIM:* «👤 Userbotlar» ni bosing, keyin API_ID, "
+        "API_HASH va sessiya stringini yuboring. Userbot sizning hisobingizdan yozadi, "
+        "buyruqlar nuqta (.) bilan: .yordam, .afk, .sales, .hisobot va boshqalar. "
+        "⚠️ Sessiya stringi hisob kalitiga teng: uni server botga yuborganingizda "
+        "server operatori (super admin) ham ko'ra oladi, shuning uchun faqat o'z "
+        "hisobingiz uchun ishlating, boshqalarga bermang. Telegram userbotni ban qilishi mumkin.\n\n"
         f"Cheklovlar: hozircha har foydalanuvchiga {MAX_BOTS_PER_USER} ta bot, jami {MAX_BOTS} ta bot "
         "(tekin server kuchsiz: 256 MB xotira, kuniga 1 GB trafik — shuning uchun limit bor). "
         "Fayl limiti: 2 MB.\n\n"
@@ -1452,6 +1616,154 @@ def build_app():
                 f"🤖 Bot #{row['id']} — {name}\nUsul: {kind}{btype}\nHolat: {status}\nYaratilgan: {row['created_at']}{_monthly_line}",
                 reply_markup=bot_buttons(row["id"], kind=row["kind"], has_token=bool(row["token_enc"])),
             )
+
+    # ---------- userbotlar (alohida bo'lim) ----------
+
+    def userbot_buttons(ub_id: int):
+        return InlineKeyboardMarkup([
+            [_ibtn("▶️ Ishga tushirish", callback_data=f"ubact:start:{ub_id}"),
+             _ibtn("⏹ To'xtatish", callback_data=f"ubact:stop:{ub_id}")],
+            [_ibtn("📄 Log", callback_data=f"ubact:log:{ub_id}"),
+             _ibtn("🗑 O'chirish", callback_data=f"ubact:delask:{ub_id}")],
+        ])
+
+    async def show_userbots(update, context):
+        user_id = update.effective_user.id
+        rows = get_user_userbots(user_id)
+        if not rows:
+            await update.message.reply_text(
+                "👤 Userbotlar bo'limi — bu yerda faqat userbotlar, Bot API botlari emas.\n\n"
+                "Yangi userbot qo'shish uchun «➕ Userbot qo'shish» ni bosing.\n"
+                "Kerak bo'ladi (ketma-ket so'raladi):\n"
+                "1) API_ID — my.telegram.org dan\n"
+                "2) API_HASH — my.telegram.org dan\n"
+                "3) Sessiya stringi — Telethon StringSession (telefon kodi EMAS, sessiya fayli EMAS)\n\n"
+                "⚠️ Sessiya stringi hisob kalitiga teng. Uni yuborganingizda serverda shifrlab saqlanadi, "
+                "lekin server operatori ham texnik jihatdan ko'ra oladi. Faqat o'z hisobingiz uchun ishlating.\n"
+                f"Limit: har biriga {MAX_USERBOTS_PER_USER} ta, jami {MAX_USERBOTS_TOTAL} ta userbot.",
+                reply_markup=InlineKeyboardMarkup([[_ibtn("➕ Userbot qo'shish", callback_data="ubact:add:0")]]),
+            )
+            return
+        for row in rows:
+            sync_userbot_status(row["id"])
+            row = get_userbot(row["id"])
+            status = "▶️ ishlayapti" if row["status"] == "running" and is_userbot_running(row["id"]) else "⏹ to'xtagan"
+            await update.message.reply_text(
+                f"👤 Userbot #{row['id']}\nHolat: {status}\nYaratilgan: {row['created_at']}",
+                reply_markup=userbot_buttons(row["id"]),
+            )
+        await update.message.reply_text(
+            "Yangi userbot qo'shish uchun:",
+            reply_markup=InlineKeyboardMarkup([[_ibtn("➕ Userbot qo'shish", callback_data="ubact:add:0")]]),
+        )
+
+    async def ask_userbot(update, context):
+        user_id = update.effective_user.id
+        if count_userbots_user(user_id) >= MAX_USERBOTS_PER_USER and not is_super_admin(user_id):
+            await update.message.reply_text(f"Limit: har biriga {MAX_USERBOTS_PER_USER} ta userbot.")
+            return
+        if count_userbots_total() >= MAX_USERBOTS_TOTAL:
+            await update.message.reply_text("Userbotlar joyi to'lgan (jami limit). Keyinroq urinib ko'ring.")
+            return
+        if not has_premium(user_id):
+            await update.message.reply_text(
+                f"💎 Userbot qo'shish ham pullik: 1 ta — {PRICE_SOM:,} so'm / {PRICE_STARS} ⭐.\n"
+                "Avval «💎 Premium olish» dan to'lang."
+            )
+            return
+        context.user_data["await"] = "ub_api_id"
+        context.user_data.pop("ub_api_id", None)
+        context.user_data.pop("ub_api_hash", None)
+        await update.message.reply_text("👤 Userbot qo'shamiz.\n1/3: API_ID ni yuboring (faqat raqam, my.telegram.org dan):")
+
+    async def handle_ub_api_id(update, context, text):
+        if not text.strip().isdigit():
+            await update.message.reply_text("API_ID faqat raqam bo'lishi kerak. Qayta yuboring:")
+            return
+        context.user_data["ub_api_id"] = text.strip()
+        context.user_data["await"] = "ub_api_hash"
+        await update.message.reply_text("2/3: API_HASH ni yuboring (my.telegram.org dan):")
+
+    async def handle_ub_api_hash(update, context, text):
+        if len(text.strip()) < 10:
+            await update.message.reply_text("API_HASH juda qisqa. Qayta yuboring:")
+            return
+        context.user_data["ub_api_hash"] = text.strip()
+        context.user_data["await"] = "ub_session"
+        await update.message.reply_text(
+            "3/3: Sessiya stringini yuboring.\n"
+            "Bu telefon kodi EMAS. Telethon StringSession stringi kerak.\n"
+            "Yuborganingizdan keyin xabaringizni o'chirishga harakat qilaman, "
+            "sessiya bazada shifrlab saqlanadi."
+        )
+
+    async def handle_ub_session(update, context, text):
+        session = text.strip()
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+        api_id = context.user_data.get("ub_api_id", "")
+        api_hash = context.user_data.get("ub_api_hash", "")
+        context.user_data.pop("await", None)
+        context.user_data.pop("ub_api_id", None)
+        context.user_data.pop("ub_api_hash", None)
+        if len(session) < 20:
+            await update.message.reply_text("Sessiya stringi juda qisqa. «👤 Userbotlar» dan qayta boshlang.")
+            return
+        user_id = update.effective_user.id
+        if not use_credit(user_id):
+            await update.message.reply_text("Premium kredit topilmadi. Avval «💎 Premium olish» dan to'lang.")
+            return
+        ub_id = create_userbot(user_id, encrypt_token(api_id), encrypt_token(api_hash),
+                               encrypt_token(session), token_fingerprint(session))
+        ok, msg = start_userbot(ub_id)
+        await update.message.reply_text(
+            f"👤 Userbot #{ub_id} yaratildi.\nHolat: {msg}\n"
+            "Logni Userbotlar bo'limidan «📄 Log» dan ko'ring. "
+            "Agar ishga tushmasa, sessiya noto'g'ri yoki eskirgan bo'lishi mumkin — o'chirib qayta qo'shing."
+        )
+
+    async def userbot_action(update, context):
+        q = update.callback_query
+        await q.answer()
+        _, action, raw_id = q.data.split(":", 2)
+        ub_id = int(raw_id)
+        if action == "add":
+            # Callback dan so'ralganda matnli so'rov uchun oddiy xabar yuborish
+            await q.message.reply_text("👤 Userbot qo'shamiz — avval API_ID ni yuboring:")
+            context.user_data["await"] = "ub_api_id"
+            return
+        row = get_userbot(ub_id)
+        if row is None or row["owner_id"] != q.from_user.id:
+            await q.edit_message_text("Userbot topilmadi yoki sizniki emas.")
+            return
+        if action == "start":
+            ok, msg = start_userbot(ub_id)
+            await q.edit_message_text(f"👤 Userbot #{ub_id}: {msg}")
+        elif action == "stop":
+            ok, msg = stop_userbot(ub_id)
+            await q.edit_message_text(f"👤 Userbot #{ub_id}: {msg}")
+        elif action == "log":
+            try:
+                data = userbot_log_path(ub_id).read_text(encoding="utf-8", errors="ignore")[-2000:] if userbot_log_path(ub_id).exists() else "(log yo'q)"
+            except Exception as e:
+                data = f"Logni o'qib bo'lmadi: {e}"
+            await q.edit_message_text(f"👤 Userbot #{ub_id} log (oxiri):\n{data}")
+        elif action == "delask":
+            await q.edit_message_text(
+                f"👤 Userbot #{ub_id} ni o'chirasizmi? Sessiya ham o'chadi.",
+                reply_markup=InlineKeyboardMarkup([[
+                    _ibtn("✅ Ha, o'chir", callback_data=f"ubact:del:{ub_id}"),
+                    _ibtn("❌ Bekor", callback_data=f"ubact:cancel:{ub_id}"),
+                ]]),
+            )
+        elif action == "del":
+            stop_userbot(ub_id)
+            delete_userbot_row(ub_id)
+            await q.edit_message_text(f"👤 Userbot #{ub_id} o'chirildi.")
+        elif action == "cancel":
+            await q.edit_message_text(f"👤 Userbot #{ub_id} o'chirish bekor qilindi.")
 
     async def bot_action(update, context):
         q = update.callback_query
@@ -2607,6 +2919,8 @@ def build_app():
             return await ask_code(update, context)
         if text == BTN_MY:
             return await my_bots(update, context)
+        if text == BTN_USERBOTS:
+            return await show_userbots(update, context)
         if text == BTN_HELP:
             return await show_help(update, context)
         if text == BTN_PREMIUM:
@@ -2705,6 +3019,12 @@ def build_app():
             return
         if context.user_data.get("await") in ("admin_grant", "admin_revoke"):
             return await handle_admin_id(update, context, text)
+        if context.user_data.get("await") == "ub_api_id":
+            return await handle_ub_api_id(update, context, text)
+        if context.user_data.get("await") == "ub_api_hash":
+            return await handle_ub_api_hash(update, context, text)
+        if context.user_data.get("await") == "ub_session":
+            return await handle_ub_session(update, context, text)
         if context.user_data.get("await") == "token":
             context.user_data.pop("await", None)
             return await handle_token(update, context, text)
@@ -2740,6 +3060,7 @@ def build_app():
     async def post_init(app):
         init_db()
         restore_running_bots()
+        restore_running_userbots()
         # Har soatda oylik tekshiruvi: muddati tugagan botning oyligi
         # hamyondan avtomatik yechiladi, balans yetmasa bot to'xtatiladi.
         import asyncio as _asyncio
@@ -2752,6 +3073,7 @@ def build_app():
     app = ApplicationBuilder().token(SERVER_BOT_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CallbackQueryHandler(bot_action, pattern=r"^act:"))
+    app.add_handler(CallbackQueryHandler(userbot_action, pattern=r"^ubact:"))
     app.add_handler(CallbackQueryHandler(make_choice, pattern=r"^make:"))
     app.add_handler(CallbackQueryHandler(make_feature_toggle, pattern=r"^makefeat:"))
     app.add_handler(CallbackQueryHandler(make_style_choice, pattern=r"^makestyle:"))
