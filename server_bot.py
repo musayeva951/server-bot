@@ -1816,8 +1816,13 @@ def build_app():
             await update.message.delete()
         except Exception:
             pass
-        if len(code) < 4:
-            await update.message.reply_text("Kod juda qisqa. Telegramdan kelgan kodni qayta yuboring:")
+        if len(code) not in (5, 6):
+            # Butun xabarni forward qilishda raqamlar aralashib ketishi mumkin:
+            # mijozni bekor qilmasdan, faqat raqamlarni so'rash kerak.
+            await update.message.reply_text(
+                "Kod faqat 5-6 ta raqam bo'lishi kerak. Butun xabarni forward qilma, "
+                "faqat kod raqamlarini yozib yubor:"
+            )
             return
         user_id = update.effective_user.id
         data = _ub_phone_clients.get(user_id)
@@ -1838,9 +1843,11 @@ def build_app():
                 )
                 return
             if "PhoneCodeInvalid" in name:
+                log.warning("Userbot kod xatosi: %s (kod uzunligi %s)", name, len(code))
                 await update.message.reply_text("Kod noto'g'ri. Qayta yuboring:")
                 return
             if "PhoneCodeExpired" in name:
+                log.warning("Userbot kod xatosi: %s (kod uzunligi %s)", name, len(code))
                 await _clear_phone_client(user_id)
                 context.user_data["await"] = "ub_phone"
                 await update.message.reply_text("Kod eskirgan. Telefon raqamingizni qayta yuboring:")
