@@ -634,6 +634,9 @@ def count_premium_users() -> int:
 
 _processes: dict[int, subprocess.Popen] = {}
 _userbot_processes: dict[int, subprocess.Popen] = {}
+# Telefon orqali userbot qo'shish paytida ochiq turgan Telethon mijozlari.
+# Server qayta yonganda bu oqim yarim qoladi — foydalanuvchi qayta boshlaydi.
+_ub_phone_clients: dict[int, dict] = {}
 
 
 def userbot_work_dir(ub_id: int) -> Path:
@@ -1527,7 +1530,8 @@ def build_app():
         "«🤖 Mening botlarim» → «💳 Oylik to'lash» dan to'lang: Stars avtomatik uzaytiradi, "
         "karta to'lovida chek yuborasiz, super admin tasdiqlasa uzayadi.\n\n"
         "*👤 Userbotlar — ALOHIDA BO'LIM:* «👤 Userbotlar» ni bosing, keyin API_ID, "
-        "API_HASH va sessiya stringini yuboring. Userbot sizning hisobingizdan yozadi, "
+        "API_HASH ni yuboring, so'ng ikki usuldan birini tanlang: telefon raqami + kod "
+        "orqali (bot sessiyani o'zi yasaydi) yoki tayyor sessiya stringi. Userbot sizning hisobingizdan yozadi, "
         "buyruqlar nuqta (.) bilan: .yordam, .afk, .sales, .hisobot va boshqalar. "
         "⚠️ Sessiya stringi hisob kalitiga teng: uni server botga yuborganingizda "
         "server operatori (super admin) ham ko'ra oladi, shuning uchun faqat o'z "
@@ -1633,15 +1637,21 @@ def build_app():
         if not rows:
             await update.message.reply_text(
                 "👤 Userbotlar bo'limi — bu yerda faqat userbotlar, Bot API botlari emas.\n\n"
-                "Yangi userbot qo'shish uchun «➕ Userbot qo'shish» ni bosing.\n"
+                "Yangi userbot qo'shish uchun «📱 Telefon orqali» ni bosing (eng oddiy yo'l) "
+                "yoki «➕ Userbot qo'shish» ni bosing.\n"
                 "Kerak bo'ladi (ketma-ket so'raladi):\n"
                 "1) API_ID — my.telegram.org dan\n"
                 "2) API_HASH — my.telegram.org dan\n"
-                "3) Sessiya stringi — Telethon StringSession (telefon kodi EMAS, sessiya fayli EMAS)\n\n"
-                "⚠️ Sessiya stringi hisob kalitiga teng. Uni yuborganingizda serverda shifrlab saqlanadi, "
-                "lekin server operatori ham texnik jihatdan ko'ra oladi. Faqat o'z hisobingiz uchun ishlating.\n"
+                "3) Telefon raqami + Telegram kodi (bot sessiyani o'zi yasaydi) "
+                "YOKI tayyor sessiya stringi — Telethon StringSession\n\n"
+                "⚠️ Telefon kodi va sessiya stringi hisob kalitiga teng. Ularni yuborganingizda serverda shifrlab saqlanadi, "
+                "lekin server operatori ham texnik jihatdan ko'ra oladi. Faqat o'z hisobingiz uchun ishlating, "
+                "kodni boshqa hech kimga/botga bermang.\n"
                 f"Limit: har biriga {MAX_USERBOTS_PER_USER} ta, jami {MAX_USERBOTS_TOTAL} ta userbot.",
-                reply_markup=InlineKeyboardMarkup([[_ibtn("➕ Userbot qo'shish", callback_data="ubact:add:0")]]),
+                reply_markup=InlineKeyboardMarkup([[
+                    _ibtn("📱 Telefon orqali", callback_data="ubact:phoneadd:0"),
+                    _ibtn("➕ Userbot qo'shish", callback_data="ubact:add:0"),
+                ]]),
             )
             return
         for row in rows:
@@ -1654,7 +1664,10 @@ def build_app():
             )
         await update.message.reply_text(
             "Yangi userbot qo'shish uchun:",
-            reply_markup=InlineKeyboardMarkup([[_ibtn("➕ Userbot qo'shish", callback_data="ubact:add:0")]]),
+            reply_markup=InlineKeyboardMarkup([[
+                _ibtn("📱 Telefon orqali", callback_data="ubact:phoneadd:0"),
+                _ibtn("➕ Userbot qo'shish", callback_data="ubact:add:0"),
+            ]]),
         )
 
     async def ask_userbot(update, context):
@@ -1674,6 +1687,7 @@ def build_app():
         context.user_data["await"] = "ub_api_id"
         context.user_data.pop("ub_api_id", None)
         context.user_data.pop("ub_api_hash", None)
+        context.user_data.pop("ub_phone_first", None)
         await update.message.reply_text("👤 Userbot qo'shamiz.\n1/3: API_ID ni yuboring (faqat raqam, my.telegram.org dan):")
 
     async def handle_ub_api_id(update, context, text):
@@ -1689,13 +1703,187 @@ def build_app():
             await update.message.reply_text("API_HASH juda qisqa. Qayta yuboring:")
             return
         context.user_data["ub_api_hash"] = text.strip()
-        context.user_data["await"] = "ub_session"
+        if context.user_data.get("ub_phone_first"):
+            context.user_data["await"] = "ub_phone"
+            await update.message.reply_text(
+                "3) Telefon raqamingizni yuboring (+998 bilan, masalan +998901234567):"
+            )
+            return
+        context.user_data["await"] = "ub_method"
         await update.message.reply_text(
-            "3/3: Sessiya stringini yuboring.\n"
-            "Bu telefon kodi EMAS. Telethon StringSession stringi kerak.\n"
-            "Yuborganingizdan keyin xabaringizni o'chirishga harakat qilaman, "
-            "sessiya bazada shifrlab saqlanadi."
+            "Qaysi usulda davom etamiz?",
+            reply_markup=InlineKeyboardMarkup([[
+                _ibtn("📱 Telefon orqali", callback_data="ubact:phone:0"),
+                _ibtn("🔑 Sessiya stringi", callback_data="ubact:session:0"),
+            ]]),
         )
+
+    async def _clear_phone_client(user_id: int):
+        data = _ub_phone_clients.pop(user_id, None)
+        if data and data.get("client") is not None:
+            try:
+                await data["client"].disconnect()
+            except Exception:
+                pass
+
+    async def _finish_phone_userbot(update, context, session: str):
+        api_id = context.user_data.get("ub_api_id", "")
+        api_hash = context.user_data.get("ub_api_hash", "")
+        context.user_data.pop("await", None)
+        context.user_data.pop("ub_api_id", None)
+        context.user_data.pop("ub_api_hash", None)
+        context.user_data.pop("ub_phone_first", None)
+        user_id = update.effective_user.id
+        if not use_credit(user_id):
+            await update.message.reply_text("Premium kredit topilmadi. Avval «💎 Premium olish» dan to'lang.")
+            return
+        ub_id = create_userbot(user_id, encrypt_token(api_id), encrypt_token(api_hash),
+                               encrypt_token(session), token_fingerprint(session))
+        ok, msg = start_userbot(ub_id)
+        await update.message.reply_text(
+            f"👤 Userbot #{ub_id} yaratildi (telefon orqali).\nHolat: {msg}\n"
+            "Logni Userbotlar bo'limidan «📄 Log» dan ko'ring. "
+            "Agar ishga tushmasa, o'chirib qayta qo'shing."
+        )
+
+    async def handle_ub_phone(update, context, text):
+        phone = "".join(ch for ch in text.strip() if ch.isdigit() or ch == "+")
+        digits = "".join(ch for ch in phone if ch.isdigit())
+        if len(digits) < 9 or len(digits) > 15:
+            await update.message.reply_text(
+                "Telefon raqami noto'g'ri. +998 bilan to'liq yuboring, masalan +998901234567:"
+            )
+            return
+        if not phone.startswith("+"):
+            phone = "+" + digits
+        user_id = update.effective_user.id
+        await _clear_phone_client(user_id)
+        api_id = context.user_data.get("ub_api_id", "")
+        api_hash = context.user_data.get("ub_api_hash", "")
+        try:
+            api_id_int = int(api_id)
+        except Exception:
+            context.user_data["await"] = "ub_api_id"
+            await update.message.reply_text("API_ID noto'g'ri. «👤 Userbotlar» dan qayta boshlang.")
+            return
+        try:
+            from telethon import TelegramClient
+            from telethon.sessions import StringSession
+            client = TelegramClient(StringSession(), api_id_int, api_hash)
+            await client.connect()
+            if await client.is_user_authorized():
+                session = client.session.save()
+                await client.disconnect()
+                return await _finish_phone_userbot(update, context, session)
+            result = await client.send_code_request(phone)
+            _ub_phone_clients[user_id] = {
+                "client": client, "phone": phone,
+                "phone_code_hash": result.phone_code_hash,
+            }
+        except Exception as e:
+            await _clear_phone_client(user_id)
+            name = type(e).__name__
+            if "FloodWait" in name:
+                secs = getattr(e, "seconds", 0)
+                await update.message.reply_text(
+                    f"Telegram biroz kutishni so'radi ({secs} soniya). Keyinroq qayta urinib ko'ring."
+                )
+                return
+            if "PhoneNumberInvalid" in name:
+                await update.message.reply_text("Telefon raqami noto'g'ri. Qayta yuboring:")
+                return
+            if "ApiIdInvalid" in name or "ApiHash" in name:
+                await update.message.reply_text(
+                    "API_ID / API_HASH noto'g'ri. my.telegram.org dan tekshirib, «👤 Userbotlar» dan qayta boshlang."
+                )
+                context.user_data.pop("await", None)
+                return
+            log.warning("Telefon orqali userbot xatosi: %s: %s", name, e)
+            await update.message.reply_text(
+                "Kod yuborib bo'lmadi. Raqamni va API ma'lumotlarini tekshirib qayta urinib ko'ring."
+            )
+            return
+        context.user_data["await"] = "ub_code"
+        await update.message.reply_text(
+            "Telegram ilovangizga kelgan kodni yuboring.\n"
+            "⚠️ Kodni faqat shu botga yuboring, boshqa hech kimga bermang. "
+            "Yuborganingizdan keyin xabaringizni o'chirishga harakat qilaman."
+        )
+
+    async def handle_ub_code(update, context, text):
+        code = "".join(ch for ch in text.strip() if ch.isdigit())
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+        if len(code) < 4:
+            await update.message.reply_text("Kod juda qisqa. Telegramdan kelgan kodni qayta yuboring:")
+            return
+        user_id = update.effective_user.id
+        data = _ub_phone_clients.get(user_id)
+        if not data or data.get("client") is None:
+            context.user_data.pop("await", None)
+            await update.message.reply_text("Oqim uzildi. «👤 Userbotlar» dan qayta boshlang.")
+            return
+        client = data["client"]
+        try:
+            from telethon.errors import SessionPasswordNeededError
+            await client.sign_in(data["phone"], code, phone_code_hash=data.get("phone_code_hash"))
+        except Exception as e:
+            name = type(e).__name__
+            if "SessionPasswordNeeded" in name:
+                context.user_data["await"] = "ub_password"
+                await update.message.reply_text(
+                    "Ikki bosqichli tasdiqlash yoqilgan. Telegram parolingizni yuboring (kod EMAS):"
+                )
+                return
+            if "PhoneCodeInvalid" in name:
+                await update.message.reply_text("Kod noto'g'ri. Qayta yuboring:")
+                return
+            if "PhoneCodeExpired" in name:
+                await _clear_phone_client(user_id)
+                context.user_data["await"] = "ub_phone"
+                await update.message.reply_text("Kod eskirgan. Telefon raqamingizni qayta yuboring:")
+                return
+            if "FloodWait" in name:
+                await update.message.reply_text("Telegram biroz kutishni so'radi. Birozdan keyin kodni qayta yuboring.")
+                return
+            log.warning("Userbot kod xatosi: %s: %s", name, e)
+            await update.message.reply_text("Kod qabul qilinmadi. Qayta yuboring:")
+            return
+        session = client.session.save()
+        await _clear_phone_client(user_id)
+        await _finish_phone_userbot(update, context, session)
+
+    async def handle_ub_password(update, context, text):
+        password = text.strip()
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+        if not password:
+            await update.message.reply_text("Parolni yuboring:")
+            return
+        user_id = update.effective_user.id
+        data = _ub_phone_clients.get(user_id)
+        if not data or data.get("client") is None:
+            context.user_data.pop("await", None)
+            await update.message.reply_text("Oqim uzildi. «👤 Userbotlar» dan qayta boshlang.")
+            return
+        client = data["client"]
+        try:
+            await client.sign_in(password=password)
+        except Exception as e:
+            name = type(e).__name__
+            if "PasswordHashInvalid" in name:
+                await update.message.reply_text("Parol noto'g'ri. Qayta yuboring:")
+                return
+            log.warning("Userbot parol xatosi: %s: %s", name, e)
+            await update.message.reply_text("Parol qabul qilinmadi. Qayta yuboring:")
+            return
+        session = client.session.save()
+        await _clear_phone_client(user_id)
+        await _finish_phone_userbot(update, context, session)
 
     async def handle_ub_session(update, context, text):
         session = text.strip()
@@ -1733,6 +1921,39 @@ def build_app():
             # Callback dan so'ralganda matnli so'rov uchun oddiy xabar yuborish
             await q.message.reply_text("👤 Userbot qo'shamiz — avval API_ID ni yuboring:")
             context.user_data["await"] = "ub_api_id"
+            context.user_data.pop("ub_phone_first", None)
+            return
+        if action == "phoneadd":
+            if count_userbots_user(q.from_user.id) >= MAX_USERBOTS_PER_USER and not is_super_admin(q.from_user.id):
+                await q.message.reply_text(f"Limit: har biriga {MAX_USERBOTS_PER_USER} ta userbot.")
+                return
+            if count_userbots_total() >= MAX_USERBOTS_TOTAL:
+                await q.message.reply_text("Userbotlar joyi to'lgan (jami limit). Keyinroq urinib ko'ring.")
+                return
+            if not has_premium(q.from_user.id):
+                await q.message.reply_text(
+                    f"💎 Userbot qo'shish ham pullik: 1 ta — {PRICE_SOM:,} so'm / {PRICE_STARS} ⭐.\n"
+                    "Avval «💎 Premium olish» dan to'lang."
+                )
+                return
+            await q.message.reply_text("📱 Telefon orqali userbot qo'shamiz — avval API_ID ni yuboring:")
+            context.user_data["await"] = "ub_api_id"
+            context.user_data["ub_phone_first"] = True
+            return
+        if action == "phone":
+            await q.message.reply_text(
+                "Telefon raqamingizni yuboring (+998 bilan, masalan +998901234567):"
+            )
+            context.user_data["await"] = "ub_phone"
+            return
+        if action == "session":
+            await q.message.reply_text(
+                "Sessiya stringini yuboring.\n"
+                "Bu telefon kodi EMAS. Telethon StringSession stringi kerak.\n"
+                "Yuborganingizdan keyin xabaringizni o'chirishga harakat qilaman, "
+                "sessiya bazada shifrlab saqlanadi."
+            )
+            context.user_data["await"] = "ub_session"
             return
         row = get_userbot(ub_id)
         if row is None or row["owner_id"] != q.from_user.id:
@@ -3025,6 +3246,35 @@ def build_app():
             return await handle_ub_api_hash(update, context, text)
         if context.user_data.get("await") == "ub_session":
             return await handle_ub_session(update, context, text)
+        if context.user_data.get("await") == "ub_method":
+            low = text.strip().lower()
+            if low in ("telefon", "📱 telefon orqali", "1", "phone"):
+                context.user_data["await"] = "ub_phone"
+                await update.message.reply_text(
+                    "Telefon raqamingizni yuboring (+998 bilan, masalan +998901234567):"
+                )
+                return
+            if low in ("sessiya", "🔑 sessiya stringi", "2", "session"):
+                context.user_data["await"] = "ub_session"
+                await update.message.reply_text(
+                    "Sessiya stringini yuboring.\n"
+                    "Bu telefon kodi EMAS. Telethon StringSession stringi kerak."
+                )
+                return
+            await update.message.reply_text(
+                "«📱 Telefon orqali» yoki «🔑 Sessiya stringi» tugmasini bosing.",
+                reply_markup=InlineKeyboardMarkup([[
+                    _ibtn("📱 Telefon orqali", callback_data="ubact:phone:0"),
+                    _ibtn("🔑 Sessiya stringi", callback_data="ubact:session:0"),
+                ]]),
+            )
+            return
+        if context.user_data.get("await") == "ub_phone":
+            return await handle_ub_phone(update, context, text)
+        if context.user_data.get("await") == "ub_code":
+            return await handle_ub_code(update, context, text)
+        if context.user_data.get("await") == "ub_password":
+            return await handle_ub_password(update, context, text)
         if context.user_data.get("await") == "token":
             context.user_data.pop("await", None)
             return await handle_token(update, context, text)
