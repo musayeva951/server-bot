@@ -637,6 +637,8 @@ _userbot_processes: dict[int, subprocess.Popen] = {}
 # Telefon orqali userbot qo'shish paytida ochiq turgan Telethon mijozlari.
 # Server qayta yonganda bu oqim yarim qoladi — foydalanuvchi qayta boshlaydi.
 _ub_phone_clients: dict[int, dict] = {}
+# QR kutish vazifalari (foydalanuvchi skanerlashini kutadi).
+_ub_qr_tasks: dict[int, object] = {}
 
 
 def userbot_work_dir(ub_id: int) -> Path:
@@ -1530,8 +1532,8 @@ def build_app():
         "«🤖 Mening botlarim» → «💳 Oylik to'lash» dan to'lang: Stars avtomatik uzaytiradi, "
         "karta to'lovida chek yuborasiz, super admin tasdiqlasa uzayadi.\n\n"
         "*👤 Userbotlar — ALOHIDA BO'LIM:* «👤 Userbotlar» ni bosing, keyin API_ID, "
-        "API_HASH ni yuboring, so'ng ikki usuldan birini tanlang: telefon raqami + kod "
-        "orqali (bot sessiyani o'zi yasaydi) yoki tayyor sessiya stringi. Userbot sizning hisobingizdan yozadi, "
+        "API_HASH ni yuboring, so'ng usulni tanlang: telefon raqami + kod, QR kodni "
+        "skanerlash (kod yozmaysiz) yoki tayyor sessiya stringi. Userbot sizning hisobingizdan yozadi, "
         "buyruqlar nuqta (.) bilan: .yordam, .afk, .sales, .hisobot va boshqalar. "
         "⚠️ Sessiya stringi hisob kalitiga teng: uni server botga yuborganingizda "
         "server operatori (super admin) ham ko'ra oladi, shuning uchun faqat o'z "
@@ -1637,19 +1639,21 @@ def build_app():
         if not rows:
             await update.message.reply_text(
                 "👤 Userbotlar bo'limi — bu yerda faqat userbotlar, Bot API botlari emas.\n\n"
-                "Yangi userbot qo'shish uchun «📱 Telefon orqali» ni bosing (eng oddiy yo'l) "
-                "yoki «➕ Userbot qo'shish» ni bosing.\n"
+                "Yangi userbot qo'shish uchun «📷 QR orqali» ni bosing (kod yozmaysiz) "
+                "yoki «📱 Telefon orqali» ni bosing.\n"
                 "Kerak bo'ladi (ketma-ket so'raladi):\n"
                 "1) API_ID — my.telegram.org dan\n"
                 "2) API_HASH — my.telegram.org dan\n"
-                "3) Telefon raqami + Telegram kodi (bot sessiyani o'zi yasaydi) "
+                "3) QR ni Telegram ilovangda skanerlash YOKI telefon raqami + Telegram kodi "
                 "YOKI tayyor sessiya stringi — Telethon StringSession\n\n"
                 "⚠️ Telefon kodi va sessiya stringi hisob kalitiga teng. Ularni yuborganingizda serverda shifrlab saqlanadi, "
                 "lekin server operatori ham texnik jihatdan ko'ra oladi. Faqat o'z hisobingiz uchun ishlating, "
                 "kodni boshqa hech kimga/botga bermang.\n"
                 f"Limit: har biriga {MAX_USERBOTS_PER_USER} ta, jami {MAX_USERBOTS_TOTAL} ta userbot.",
                 reply_markup=InlineKeyboardMarkup([[
+                    _ibtn("📷 QR orqali", callback_data="ubact:qradd:0"),
                     _ibtn("📱 Telefon orqali", callback_data="ubact:phoneadd:0"),
+                ], [
                     _ibtn("➕ Userbot qo'shish", callback_data="ubact:add:0"),
                 ]]),
             )
@@ -1665,7 +1669,9 @@ def build_app():
         await update.message.reply_text(
             "Yangi userbot qo'shish uchun:",
             reply_markup=InlineKeyboardMarkup([[
+                _ibtn("📷 QR orqali", callback_data="ubact:qradd:0"),
                 _ibtn("📱 Telefon orqali", callback_data="ubact:phoneadd:0"),
+            ], [
                 _ibtn("➕ Userbot qo'shish", callback_data="ubact:add:0"),
             ]]),
         )
@@ -1688,6 +1694,7 @@ def build_app():
         context.user_data.pop("ub_api_id", None)
         context.user_data.pop("ub_api_hash", None)
         context.user_data.pop("ub_phone_first", None)
+        context.user_data.pop("ub_qr_first", None)
         await update.message.reply_text("👤 Userbot qo'shamiz.\n1/3: API_ID ni yuboring (faqat raqam, my.telegram.org dan):")
 
     async def handle_ub_api_id(update, context, text):
@@ -1709,11 +1716,17 @@ def build_app():
                 "3) Telefon raqamingizni yuboring (+998 bilan, masalan +998901234567):"
             )
             return
+        if context.user_data.get("ub_qr_first"):
+            context.user_data["await"] = "ub_qr_wait"
+            await handle_ub_qr_start(update, context)
+            return
         context.user_data["await"] = "ub_method"
         await update.message.reply_text(
             "Qaysi usulda davom etamiz?",
             reply_markup=InlineKeyboardMarkup([[
+                _ibtn("📷 QR orqali", callback_data="ubact:qr:0"),
                 _ibtn("📱 Telefon orqali", callback_data="ubact:phone:0"),
+            ], [
                 _ibtn("🔑 Sessiya stringi", callback_data="ubact:session:0"),
             ]]),
         )
@@ -1726,6 +1739,170 @@ def build_app():
             except Exception:
                 pass
 
+    async def _cancel_qr_task(user_id: int):
+        task = _ub_qr_tasks.pop(user_id, None)
+        if task is not None:
+            try:
+                task.cancel()
+            except Exception:
+                pass
+
+    async def _wait_qr_login(bot, app, user_id: int, chat_id: int):
+        """QR skanerlanishini kutadi. Muvaffaqiyatda userbot yaratadi."""
+        data = _ub_phone_clients.get(user_id)
+        if not data or data.get("client") is None or data.get("qr_login") is None:
+            return
+        client = data["client"]
+        qr_login = data["qr_login"]
+        try:
+            await qr_login.wait()
+        except Exception as e:
+            name = type(e).__name__
+            if "SessionPasswordNeeded" in name:
+                # 2FA paroli kerak — mijozni saqlab, parol so'rashga o'tamiz.
+                try:
+                    ud = app.user_data.get(user_id, {})
+                    ud["await"] = "ub_password"
+                except Exception:
+                    pass
+                try:
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text="QR skanerlandi, lekin ikki bosqichli tasdiqlash yoqilgan. "
+                             "Telegram parolingizni yuboring (kod EMAS):",
+                    )
+                except Exception:
+                    pass
+                return
+            log.warning("Userbot QR xatosi: %s: %s", name, e)
+            await _clear_phone_client(user_id)
+            try:
+                ud = app.user_data.get(user_id, {})
+                ud.pop("await", None)
+                ud.pop("ub_api_id", None)
+                ud.pop("ub_api_hash", None)
+                ud.pop("ub_qr_first", None)
+            except Exception:
+                pass
+            try:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text="QR eskirgan yoki skanerlanmadi. «👤 Userbotlar» dan qayta boshlang.",
+                )
+            except Exception:
+                pass
+            return
+        # Muvaffaqiyat: sessiyani saqlab, userbot yaratamiz.
+        try:
+            session = client.session.save()
+        except Exception as e:
+            log.warning("Userbot QR sessiya xatosi: %s", e)
+            await _clear_phone_client(user_id)
+            return
+        await _clear_phone_client(user_id)
+        api_id = ""
+        api_hash = ""
+        try:
+            ud = app.user_data.get(user_id, {})
+            api_id = ud.get("ub_api_id", "")
+            api_hash = ud.get("ub_api_hash", "")
+            ud.pop("await", None)
+            ud.pop("ub_api_id", None)
+            ud.pop("ub_api_hash", None)
+            ud.pop("ub_qr_first", None)
+        except Exception:
+            pass
+        if not use_credit(user_id):
+            try:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text="Premium kredit topilmadi. Avval «💎 Premium olish» dan to'lang.",
+                )
+            except Exception:
+                pass
+            return
+        ub_id = create_userbot(user_id, encrypt_token(api_id), encrypt_token(api_hash),
+                               encrypt_token(session), token_fingerprint(session))
+        ok, msg = start_userbot(ub_id)
+        try:
+            await bot.send_message(
+                chat_id=chat_id,
+                text=f"👤 Userbot #{ub_id} yaratildi (QR orqali).\nHolat: {msg}\n"
+                     "Logni Userbotlar bo'limidan «📄 Log» dan ko'ring.",
+            )
+        except Exception:
+            pass
+
+    async def handle_ub_qr_start(update, context):
+        user_id = update.effective_user.id
+        chat_id = update.effective_chat.id
+        await _cancel_qr_task(user_id)
+        await _clear_phone_client(user_id)
+        api_id = context.user_data.get("ub_api_id", "")
+        api_hash = context.user_data.get("ub_api_hash", "")
+        try:
+            api_id_int = int(api_id)
+        except Exception:
+            context.user_data["await"] = "ub_api_id"
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="API_ID noto'g'ri. «👤 Userbotlar» dan qayta boshlang.",
+            )
+            return
+        try:
+            import io as _io
+            import qrcode as _qrcode
+            from telethon import TelegramClient
+            from telethon.sessions import StringSession
+            client = TelegramClient(StringSession(), api_id_int, api_hash)
+            await client.connect()
+            qr_login = await client.qr_login()
+            url = qr_login.url
+            buf = _io.BytesIO()
+            img = _qrcode.make(url)
+            img.save(buf, format="PNG")
+            buf.name = "qr.png"
+            buf.seek(0)
+            _ub_phone_clients[user_id] = {
+                "client": client, "qr_login": qr_login,
+                "api_id": api_id, "api_hash": api_hash,
+            }
+        except Exception as e:
+            await _clear_phone_client(user_id)
+            log.warning("Userbot QR yaratish xatosi: %s: %s", type(e).__name__, e)
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="QR yaratib bo'lmadi. API ma'lumotlarini tekshirib, «👤 Userbotlar» dan qayta boshlang.",
+            )
+            context.user_data.pop("await", None)
+            return
+        try:
+            await context.bot.send_photo(
+                chat_id=chat_id,
+                photo=buf,
+                caption="📷 Shu QR ni Telegram ilovangda skanerla:\n"
+                        "Telegram → Sozlamalar → Qurilmalar → Qurilmani ulash.\n"
+                        "Kod yozmaysiz. QR eskirsa, qayta boshlash kerak bo'ladi.",
+            )
+        except Exception as e:
+            await _clear_phone_client(user_id)
+            log.warning("Userbot QR yuborish xatosi: %s: %s", type(e).__name__, e)
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="QR yuborib bo'lmadi. «👤 Userbotlar» dan qayta boshlang.",
+            )
+            context.user_data.pop("await", None)
+            return
+        context.user_data["await"] = "ub_qr_wait"
+        try:
+            import asyncio as _asyncio
+            task = _asyncio.create_task(
+                _wait_qr_login(context.bot, context.application, user_id, chat_id)
+            )
+            _ub_qr_tasks[user_id] = task
+        except Exception as e:
+            log.warning("Userbot QR kutish xatosi: %s: %s", type(e).__name__, e)
+
     async def _finish_phone_userbot(update, context, session: str):
         api_id = context.user_data.get("ub_api_id", "")
         api_hash = context.user_data.get("ub_api_hash", "")
@@ -1733,6 +1910,7 @@ def build_app():
         context.user_data.pop("ub_api_id", None)
         context.user_data.pop("ub_api_hash", None)
         context.user_data.pop("ub_phone_first", None)
+        context.user_data.pop("ub_qr_first", None)
         user_id = update.effective_user.id
         if not use_credit(user_id):
             await update.message.reply_text("Premium kredit topilmadi. Avval «💎 Premium olish» dan to'lang.")
@@ -1929,6 +2107,29 @@ def build_app():
             await q.message.reply_text("👤 Userbot qo'shamiz — avval API_ID ni yuboring:")
             context.user_data["await"] = "ub_api_id"
             context.user_data.pop("ub_phone_first", None)
+            context.user_data.pop("ub_qr_first", None)
+            return
+        if action == "qradd":
+            if count_userbots_user(q.from_user.id) >= MAX_USERBOTS_PER_USER and not is_super_admin(q.from_user.id):
+                await q.message.reply_text(f"Limit: har biriga {MAX_USERBOTS_PER_USER} ta userbot.")
+                return
+            if count_userbots_total() >= MAX_USERBOTS_TOTAL:
+                await q.message.reply_text("Userbotlar joyi to'lgan (jami limit). Keyinroq urinib ko'ring.")
+                return
+            if not has_premium(q.from_user.id):
+                await q.message.reply_text(
+                    f"💎 Userbot qo'shish ham pullik: 1 ta — {PRICE_SOM:,} so'm / {PRICE_STARS} ⭐.\n"
+                    "Avval «💎 Premium olish» dan to'lang."
+                )
+                return
+            await q.message.reply_text("📷 QR orqali userbot qo'shamiz — avval API_ID ni yuboring:")
+            context.user_data["await"] = "ub_api_id"
+            context.user_data["ub_qr_first"] = True
+            context.user_data.pop("ub_phone_first", None)
+            return
+        if action == "qr":
+            context.user_data["await"] = "ub_qr_wait"
+            await handle_ub_qr_start(update, context)
             return
         if action == "phoneadd":
             if count_userbots_user(q.from_user.id) >= MAX_USERBOTS_PER_USER and not is_super_admin(q.from_user.id):
@@ -1946,6 +2147,7 @@ def build_app():
             await q.message.reply_text("📱 Telefon orqali userbot qo'shamiz — avval API_ID ni yuboring:")
             context.user_data["await"] = "ub_api_id"
             context.user_data["ub_phone_first"] = True
+            context.user_data.pop("ub_qr_first", None)
             return
         if action == "phone":
             await q.message.reply_text(
@@ -3274,6 +3476,12 @@ def build_app():
                     _ibtn("📱 Telefon orqali", callback_data="ubact:phone:0"),
                     _ibtn("🔑 Sessiya stringi", callback_data="ubact:session:0"),
                 ]]),
+            )
+            return
+        if context.user_data.get("await") == "ub_qr_wait":
+            await update.message.reply_text(
+                "QR skanerlanishi kutilmoqda. Telegram ilovangda Sozlamalar → Qurilmalar → "
+                "Qurilmani ulash dan QR ni skanerla. QR eskirsa, «👤 Userbotlar» dan qayta boshlang."
             )
             return
         if context.user_data.get("await") == "ub_phone":

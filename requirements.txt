@@ -1,3 +1,5 @@
 python-telegram-bot>=22.7,<23
 cryptography>=42
 telethon
+qrcode
+pillow
